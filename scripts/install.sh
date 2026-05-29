@@ -2,7 +2,7 @@
 set -e
 
 # Configuration
-REPO="username/hayate"
+REPO="shiinasaku/hayate"
 BINARY_NAME="hayate"
 
 # ANSI Color Codes (Strictly No Unicode Icons)
