@@ -19,7 +19,17 @@ import (
 	"github.com/quic-go/quic-go"
 )
 
-const Version = "1.1.0"
+const Version = "2.0.0"
+
+const (
+	frameFlagRaw  byte = 0x00
+	frameFlagZstd byte = 0x01
+
+	maxFilenameBytes          = 4096
+	maxCompressedOverhead     = 4*1024*1024/8 + 64*1024
+	maxMetadataCiphertextSize = 2 + maxFilenameBytes + 8 + 12 + 16
+	maxInt64                  = int64(^uint64(0) >> 1)
+)
 
 var (
 	// 4MB chunks reduce QUIC framing overhead vs 1MB and better saturate fast links.
@@ -49,10 +59,10 @@ var (
 			return &b
 		},
 	}
-	// 4-byte frame header prefix + chunk + zstd overhead + AEAD nonce (12) + tag (16)
+	// 4-byte frame header prefix + encrypted 1-byte frame flag + chunk + zstd overhead + AEAD nonce (12) + tag (16).
 	cipherPool = sync.Pool{
 		New: func() any {
-			b := make([]byte, 4+ChunkSize+8192)
+			b := make([]byte, 4+12+1+ChunkSize+maxCompressedOverhead+16)
 			return &b
 		},
 	}
@@ -74,8 +84,8 @@ type chunkResult struct {
 
 // recvJob carries a raw encrypted frame read from the network.
 type recvJob struct {
-	index    int64
-	data     []byte
+	index     int64
+	data      []byte
 	dataOwner *[]byte
 }
 
@@ -90,7 +100,7 @@ type recvResult struct {
 // SendFile reads the source file, compresses and encrypts chunks in parallel,
 // and streams them over QUIC using coalesced frame writes.
 // Progress callback receives plaintext bytes consumed.
-func SendFile(ctx context.Context, path string, stream *quic.Stream, key []byte, progressCb func(int64)) (string, error) {
+func SendFile(ctx context.Context, path string, stream *quic.Stream, key []byte, compressMode string, progressCb func(int64)) (string, error) {
 	file, err := os.Open(path)
 	if err != nil {
 		return "", fmt.Errorf("opening file: %w", err)
@@ -107,11 +117,15 @@ func SendFile(ctx context.Context, path string, stream *quic.Stream, key []byte,
 		return "", fmt.Errorf("creating nonce gen: %w", err)
 	}
 
-	zstdEncoder, err := zstd.NewWriter(nil, zstd.WithEncoderLevel(zstd.SpeedFastest), zstd.WithEncoderConcurrency(1))
-	if err != nil {
-		return "", fmt.Errorf("initializing zstd encoder: %w", err)
+	compressChunks := ShouldCompress(path, compressMode)
+	var zstdEncoder *zstd.Encoder
+	if compressChunks {
+		zstdEncoder, err = zstd.NewWriter(nil, zstd.WithEncoderLevel(zstd.SpeedFastest), zstd.WithEncoderConcurrency(1))
+		if err != nil {
+			return "", fmt.Errorf("initializing zstd encoder: %w", err)
+		}
+		defer zstdEncoder.Close()
 	}
-	defer zstdEncoder.Close()
 
 	shaHasher := sha256.New()
 	jobs := make(chan chunkJob, MaxQueue)
@@ -120,7 +134,7 @@ func SendFile(ctx context.Context, path string, stream *quic.Stream, key []byte,
 
 	for i := 0; i < NumWorkers; i++ {
 		wg.Add(1)
-		go sendWorker(ctx, &wg, aead, ng, zstdEncoder, jobs, results)
+		go sendWorker(ctx, &wg, aead, ng, zstdEncoder, compressMode, compressChunks, jobs, results)
 	}
 
 	go func() {
@@ -207,21 +221,43 @@ checkReader:
 	return hex.EncodeToString(shaHasher.Sum(nil)), nil
 }
 
-func sendWorker(ctx context.Context, wg *sync.WaitGroup, aead cipher.AEAD, ng *crypto.NonceGen, enc *zstd.Encoder, jobs <-chan chunkJob, results chan<- chunkResult) {
+func sendWorker(ctx context.Context, wg *sync.WaitGroup, aead cipher.AEAD, ng *crypto.NonceGen, enc *zstd.Encoder, compressMode string, compressChunks bool, jobs <-chan chunkJob, results chan<- chunkResult) {
 	defer wg.Done()
 	var compBuf []byte
+	var plainFrame []byte
 
 	for job := range jobs {
-		compBuf = enc.EncodeAll(job.data[:job.size], compBuf[:0])
+		payload := job.data[:job.size]
+		flag := frameFlagRaw
+		if compressChunks {
+			compBuf = enc.EncodeAll(payload, compBuf[:0])
+			if compressMode == CompressAlways || len(compBuf) < len(payload) {
+				payload = compBuf
+				flag = frameFlagZstd
+			}
+		}
 		rawN := job.size
-		chunkPool.Put(&job.data)
 
 		outPtr := cipherPool.Get().(*[]byte)
 		outBuf := *outPtr
 
-		// Reserve 4 bytes for frame header at the front; encrypt into outBuf[4:]
+		if cap(plainFrame) < 1+len(payload) {
+			plainFrame = make([]byte, 1+len(payload))
+		}
+		plainFrame = plainFrame[:1+len(payload)]
+		plainFrame[0] = flag
+		copy(plainFrame[1:], payload)
+		chunkPool.Put(&job.data)
+
+		// Reserve 4 bytes for frame header at the front; encrypt into outBuf[4:].
+		required := 4 + aead.NonceSize() + len(plainFrame) + aead.Overhead()
+		if cap(outBuf) < required {
+			b := make([]byte, required)
+			outPtr = &b
+			outBuf = *outPtr
+		}
 		encSlice := outBuf[4:]
-		sealed, err := crypto.EncryptInPlace(aead, ng, compBuf, encSlice)
+		sealed, err := crypto.EncryptInPlace(aead, ng, plainFrame, encSlice)
 		if err != nil {
 			cipherPool.Put(outPtr)
 			select {
@@ -295,6 +331,11 @@ func ReceiveFile(ctx context.Context, path string, stream *quic.Stream, key []by
 				return
 			}
 			chunkLen := binary.BigEndian.Uint32(headerBuf)
+			maxFrameLen := uint32(aead.NonceSize() + 1 + ChunkSize + maxCompressedOverhead + aead.Overhead())
+			if chunkLen == 0 || chunkLen > maxFrameLen {
+				readErrChan <- fmt.Errorf("invalid frame payload length: %d", chunkLen)
+				return
+			}
 
 			bufPtr := cipherPool.Get().(*[]byte)
 			if uint32(cap(*bufPtr)) < chunkLen {
@@ -406,20 +447,52 @@ func recvWorker(ctx context.Context, wg *sync.WaitGroup, aead cipher.AEAD, dec *
 			return
 		}
 
-		// Decompress into pooled buffer
+		if len(decData) < 1 {
+			select {
+			case results <- recvResult{index: job.index, err: fmt.Errorf("frame missing compression flag")}:
+			case <-ctx.Done():
+			}
+			return
+		}
+
+		flag := decData[0]
+		payload := decData[1:]
+
 		decompPtr := chunkPool.Get().(*[]byte)
-		decompBuf, err := dec.DecodeAll(decData, (*decompPtr)[:0])
-		if err != nil {
+		var plaintext []byte
+		switch flag {
+		case frameFlagRaw:
+			if cap(*decompPtr) < len(payload) {
+				b := make([]byte, ChunkSize)
+				if cap(b) < len(payload) {
+					b = make([]byte, len(payload))
+				}
+				decompPtr = &b
+			}
+			plaintext = (*decompPtr)[:len(payload)]
+			copy(plaintext, payload)
+		case frameFlagZstd:
+			var err error
+			plaintext, err = dec.DecodeAll(payload, (*decompPtr)[:0])
+			if err != nil {
+				chunkPool.Put(decompPtr)
+				select {
+				case results <- recvResult{index: job.index, err: fmt.Errorf("decompressing: %w", err)}:
+				case <-ctx.Done():
+				}
+				return
+			}
+		default:
 			chunkPool.Put(decompPtr)
 			select {
-			case results <- recvResult{index: job.index, err: fmt.Errorf("decompressing: %w", err)}:
+			case results <- recvResult{index: job.index, err: fmt.Errorf("invalid frame compression flag: 0x%02x", flag)}:
 			case <-ctx.Done():
 			}
 			return
 		}
 
 		select {
-		case results <- recvResult{index: job.index, plaintext: decompBuf, plainOwner: decompPtr}:
+		case results <- recvResult{index: job.index, plaintext: plaintext, plainOwner: decompPtr}:
 		case <-ctx.Done():
 			chunkPool.Put(decompPtr)
 			return
@@ -449,6 +522,12 @@ func EstablishSecureStreamSender(ctx context.Context, stream *quic.Stream, filen
 	}
 
 	filenameBytes := []byte(filename)
+	if len(filenameBytes) == 0 {
+		return nil, fmt.Errorf("filename is empty")
+	}
+	if len(filenameBytes) > maxFilenameBytes {
+		return nil, fmt.Errorf("filename too long: %d bytes", len(filenameBytes))
+	}
 	metadataBytes := make([]byte, 2+len(filenameBytes)+8)
 	binary.BigEndian.PutUint16(metadataBytes[0:2], uint16(len(filenameBytes)))
 	copy(metadataBytes[2:2+len(filenameBytes)], filenameBytes)
@@ -497,6 +576,9 @@ func EstablishSecureStreamReceiver(ctx context.Context, stream *quic.Stream) ([]
 		return nil, "", 0, fmt.Errorf("reading metadata length: %w", err)
 	}
 	encLen := binary.BigEndian.Uint32(lengthBuf)
+	if encLen == 0 || encLen > maxMetadataCiphertextSize {
+		return nil, "", 0, fmt.Errorf("invalid metadata length: %d", encLen)
+	}
 
 	encMetadata := make([]byte, encLen)
 	if _, err := io.ReadFull(stream, encMetadata); err != nil {
@@ -517,8 +599,15 @@ func EstablishSecureStreamReceiver(ctx context.Context, stream *quic.Stream) ([]
 		return nil, "", 0, fmt.Errorf("metadata truncated: got %d, expected %d", len(metadataBytes), 2+nameLen+8)
 	}
 
+	if nameLen == 0 || nameLen > maxFilenameBytes {
+		return nil, "", 0, fmt.Errorf("invalid filename length: %d", nameLen)
+	}
 	filename := string(metadataBytes[2 : 2+nameLen])
-	fileSize := int64(binary.BigEndian.Uint64(metadataBytes[2+nameLen : 2+nameLen+8]))
+	rawSize := binary.BigEndian.Uint64(metadataBytes[2+nameLen : 2+nameLen+8])
+	if rawSize > uint64(maxInt64) {
+		return nil, "", 0, fmt.Errorf("file size too large: %d", rawSize)
+	}
+	fileSize := int64(rawSize)
 
 	return key, filename, fileSize, nil
 }

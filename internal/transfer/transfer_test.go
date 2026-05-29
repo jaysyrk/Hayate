@@ -118,7 +118,7 @@ func TestFileTransferPipeline(t *testing.T) {
 	}
 	defer clientStream.Close()
 
-	sendHash, err := SendFile(ctx, srcPath, clientStream, keyA, func(progress int64) {})
+	sendHash, err := SendFile(ctx, srcPath, clientStream, keyA, CompressAuto, func(progress int64) {})
 	if err != nil {
 		t.Fatalf("SendFile failed: %v", err)
 	}

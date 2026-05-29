@@ -13,6 +13,7 @@ import (
 	"github.com/charmbracelet/bubbles/spinner"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
+	"github.com/muesli/termenv"
 )
 
 type State int
@@ -29,10 +30,11 @@ const (
 type PeerDiscoveredMsg []network.Peer
 
 type StartTransferMsg struct {
-	FileName string
-	FileSize int64
-	IsSend   bool
-	PeerAddr string
+	FileName  string
+	FileSize  int64
+	IsSend    bool
+	PeerAddr  string
+	LocalAddr string
 }
 
 type ProgressMsg int64
@@ -65,6 +67,17 @@ var (
 	slate  = lipgloss.Color("#5C6370")
 	text   = lipgloss.Color("#E8EAED")
 	dim    = lipgloss.Color("#3A3A4E")
+
+	asciiBorder = lipgloss.Border{
+		Top:         "-",
+		Bottom:      "-",
+		Left:        "|",
+		Right:       "|",
+		TopLeft:     "+",
+		TopRight:    "+",
+		BottomLeft:  "+",
+		BottomRight: "+",
+	}
 
 	logoStyle = lipgloss.NewStyle().
 			Foreground(indigo).
@@ -107,17 +120,17 @@ var (
 			Foreground(red)
 
 	boxStyle = lipgloss.NewStyle().
-			Border(lipgloss.RoundedBorder()).
+			Border(asciiBorder).
 			BorderForeground(indigo).
 			Padding(1, 3)
 
 	successBoxStyle = lipgloss.NewStyle().
-			Border(lipgloss.RoundedBorder()).
+			Border(asciiBorder).
 			BorderForeground(green).
 			Padding(1, 3)
 
 	errorBoxStyle = lipgloss.NewStyle().
-			Border(lipgloss.RoundedBorder()).
+			Border(asciiBorder).
 			BorderForeground(red).
 			Padding(1, 3)
 
@@ -163,9 +176,12 @@ type Model struct {
 	fileName     string
 	fileSize     int64
 	peerAddr     string
+	localAddr    string
 	advertised   string
 	localIP      string
 	port         int
+	width        int
+	asciiOnly    bool
 	peers        []network.Peer
 	selectedIdx  int
 	progress     int64
@@ -187,7 +203,7 @@ type Model struct {
 
 func NewModel(ctx context.Context, cancel context.CancelFunc, mode string, filePath string, peerAddr string, port int, localIP string, advertised string) Model {
 	s := spinner.New()
-	s.Spinner = spinner.Dot
+	s.Spinner = spinner.Line
 	s.Style = lipgloss.NewStyle().Foreground(cyan)
 
 	return Model{
@@ -197,7 +213,10 @@ func NewModel(ctx context.Context, cancel context.CancelFunc, mode string, fileP
 		peerAddr:         peerAddr,
 		port:             port,
 		localIP:          localIP,
+		localAddr:        localIP,
 		advertised:       advertised,
+		width:            80,
+		asciiOnly:        !termenv.HasDarkBackground() || termenv.ColorProfile() == termenv.Ascii,
 		spinner:          s,
 		MsgChan:          make(chan tea.Msg, 64),
 		SelectedPeerChan: make(chan network.Peer, 1),
@@ -227,6 +246,12 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	var cmds []tea.Cmd
 
 	switch msg := msg.(type) {
+	case tea.WindowSizeMsg:
+		m.width = msg.Width
+		if msg.Width > 0 && msg.Width < 72 {
+			m.asciiOnly = true
+		}
+
 	case tea.KeyMsg:
 		switch msg.String() {
 		case "ctrl+c", "esc":
@@ -280,6 +305,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if msg.PeerAddr != "" {
 			m.peerAddr = msg.PeerAddr
 		}
+		if msg.LocalAddr != "" {
+			m.localAddr = msg.LocalAddr
+		}
 		m.startTime = time.Now()
 		m.lastTime = m.startTime
 		m.lastProgress = 0
@@ -330,7 +358,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 func (m Model) View() string {
 	var s strings.Builder
 
-	s.WriteString(renderHeader())
+	s.WriteString(m.renderHeader())
 
 	switch m.state {
 	case StateDiscover:
@@ -350,13 +378,19 @@ func (m Model) View() string {
 	return s.String()
 }
 
-func renderHeader() string {
-	logo := logoStyle.Render(`    __ __                 __
+func (m Model) renderHeader() string {
+	logo := `    __ __                 __
    / // /___ ___ __ ___ _/ /____
   / _  / _ '/ // / _ '/ __/ -_)
  /_//_/\_,_/\_, /\_,_/\__/\___/
-           /___/`)
-	ver := versionStyle.Render(" v" + transfer.Version)
+           /___/`
+	if !m.asciiOnly {
+		logo = logoStyle.Render(logo)
+	}
+	ver := " v" + transfer.Version
+	if !m.asciiOnly {
+		ver = versionStyle.Render(ver)
+	}
 	return logo + ver + "\n\n"
 }
 
@@ -366,7 +400,11 @@ func (m Model) viewDiscover() string {
 	mode := strings.ToUpper(m.Mode)
 	s.WriteString(sectionStyle.Render("[ "+mode+" ]") + "\n\n")
 
-	s.WriteString(fmt.Sprintf("  %s ", m.spinner.View()))
+	spin := "-"
+	if !m.asciiOnly {
+		spin = m.spinner.View()
+	}
+	s.WriteString(fmt.Sprintf("  %s ", spin))
 	if m.Mode == "send" {
 		s.WriteString("Scanning local network for active receivers...\n")
 	} else {
@@ -389,7 +427,7 @@ func (m Model) viewSelectPeer() string {
 	// Table header
 	hdr := fmt.Sprintf("    %-20s  %-22s  %s", "NAME", "ADDRESS", "OS")
 	s.WriteString(tableHeaderStyle.Render(hdr) + "\n")
-	s.WriteString(tableHeaderStyle.Render("    " + strings.Repeat("-", 54)) + "\n")
+	s.WriteString(tableHeaderStyle.Render("    "+strings.Repeat("-", 54)) + "\n")
 
 	for i, p := range m.peers {
 		addr := fmt.Sprintf("%s:%d", p.IP, p.Port)
@@ -406,7 +444,7 @@ func (m Model) viewSelectPeer() string {
 		}
 	}
 
-	s.WriteString(tableHeaderStyle.Render("    " + strings.Repeat("-", 54)) + "\n")
+	s.WriteString(tableHeaderStyle.Render("    "+strings.Repeat("-", 54)) + "\n")
 	s.WriteString(hint("j/k or Up/Down to navigate  |  Enter to select  |  Esc to cancel"))
 	return s.String()
 }
@@ -415,8 +453,12 @@ func (m Model) viewHandshake() string {
 	var s strings.Builder
 
 	s.WriteString(sectionStyle.Render("[ SECURING CONNECTION ]") + "\n\n")
+	spin := "-"
+	if !m.asciiOnly {
+		spin = m.spinner.View()
+	}
 	s.WriteString(fmt.Sprintf("  %s Exchanging cryptographic keys with %s...\n",
-		m.spinner.View(), valueStyle.Render(m.peerAddr)))
+		spin, m.renderValue(m.peerAddr)))
 	s.WriteString(hint("Esc to abort"))
 	return s.String()
 }
@@ -425,10 +467,10 @@ func (m Model) viewTransferring() string {
 	var s strings.Builder
 
 	direction := "RECEIVING"
-	arrow := "<--"
+	arrow := "<-"
 	if m.isSend {
 		direction = "SENDING"
-		arrow = "-->"
+		arrow = "->"
 	}
 
 	s.WriteString(sectionStyle.Render("[ "+direction+" ]") + "\n\n")
@@ -438,20 +480,27 @@ func (m Model) viewTransferring() string {
 		pct = float64(m.progress) / float64(m.fileSize) * 100.0
 	}
 
-	s.WriteString(kv("File", m.fileName))
-	s.WriteString(kv("Size", formatBytes(m.fileSize)))
-	s.WriteString(kv("Peer", fmt.Sprintf("localhost %s %s", arrow, m.peerAddr)))
+	s.WriteString(m.kv("File", m.fit(m.fileName, 48)))
+	s.WriteString(m.kv("Size", formatBytes(m.fileSize)))
+	s.WriteString(m.kv("Peer", fmt.Sprintf("%s %s %s", m.localAddr, arrow, m.peerAddr)))
 	s.WriteString("\n")
 
-	// Large, prominent progress bar
-	bar := drawProgressBar(40, m.progress, m.fileSize)
-	pctStr := pctStyle.Render(fmt.Sprintf("%5.1f%%", pct))
+	barWidth := m.progressWidth()
+	bar := m.drawProgressBar(barWidth, m.progress, m.fileSize)
+	pctStr := fmt.Sprintf("%5.1f%%", pct)
+	if !m.asciiOnly {
+		pctStr = pctStyle.Render(pctStr)
+	}
+	speed := formatSpeed(m.speed)
+	if !m.asciiOnly {
+		speed = speedStyle.Render(speed)
+	}
 	s.WriteString(fmt.Sprintf("  %s  %s  %s\n",
-		bar, pctStr, speedStyle.Render(formatSpeed(m.speed))))
+		bar, pctStr, speed))
 
 	s.WriteString("\n")
-	s.WriteString(kv("Transferred", fmt.Sprintf("%s / %s", formatBytes(m.progress), formatBytes(m.fileSize))))
-	s.WriteString(kv("ETA", formatDuration(m.eta)))
+	s.WriteString(m.kv("Transferred", fmt.Sprintf("%s / %s", formatBytes(m.progress), formatBytes(m.fileSize))))
+	s.WriteString(m.kv("ETA", formatDuration(m.eta)))
 
 	s.WriteString(hint("Esc to abort"))
 	return s.String()
@@ -472,14 +521,29 @@ func (m Model) viewCompleted() string {
 	}
 
 	var b strings.Builder
-	b.WriteString(successStyle.Render("  "+direction+" Successfully") + "\n\n")
-	b.WriteString(kvInner("File", m.fileName))
-	b.WriteString(kvInner("Size", formatBytes(m.fileSize)))
-	b.WriteString(kvInner("SHA-256", hashStyle.Render(m.hash)))
-	b.WriteString(kvInner("Speed", speedStyle.Render(formatSpeed(avgSpeed))))
-	b.WriteString(kvInner("Duration", formatDuration(duration)))
+	title := "  " + direction + " Successfully"
+	if !m.asciiOnly {
+		title = successStyle.Render(title)
+	}
+	b.WriteString(title + "\n\n")
+	b.WriteString(m.kvInner("File", m.fit(m.fileName, 48)))
+	b.WriteString(m.kvInner("Size", formatBytes(m.fileSize)))
+	hash := m.hash
+	if m.width > 0 && m.width < 92 && len(hash) > 24 {
+		hash = hash[:24]
+	}
+	if !m.asciiOnly {
+		hash = hashStyle.Render(hash)
+	}
+	b.WriteString(m.kvInner("SHA-256", hash))
+	speed := formatSpeed(avgSpeed)
+	if !m.asciiOnly {
+		speed = speedStyle.Render(speed)
+	}
+	b.WriteString(m.kvInner("Speed", speed))
+	b.WriteString(m.kvInner("Duration", formatDuration(duration)))
 
-	s.WriteString(successBoxStyle.Render(b.String()))
+	s.WriteString(m.box(b.String(), false))
 	s.WriteString("\n")
 	s.WriteString(hint("Enter or Q to exit"))
 	return s.String()
@@ -489,10 +553,18 @@ func (m Model) viewError() string {
 	var s strings.Builder
 
 	var b strings.Builder
-	b.WriteString(errorStyle.Render("  Transfer Failed") + "\n\n")
-	b.WriteString(kvInner("Error", m.err.Error()))
+	title := "  Transfer Failed"
+	if !m.asciiOnly {
+		title = errorStyle.Render(title)
+	}
+	b.WriteString(title + "\n\n")
+	errText := ""
+	if m.err != nil {
+		errText = m.err.Error()
+	}
+	b.WriteString(m.kvInner("Error", m.fit(errText, 60)))
 
-	s.WriteString(errorBoxStyle.Render(b.String()))
+	s.WriteString(m.box(b.String(), true))
 	s.WriteString("\n")
 	s.WriteString(hint("Enter or Q to exit"))
 	return s.String()
@@ -500,11 +572,17 @@ func (m Model) viewError() string {
 
 // -- Helpers --
 
-func kv(label, value string) string {
+func (m Model) kv(label, value string) string {
+	if m.asciiOnly {
+		return "  " + rightPad(label, 14) + "  " + value + "\n"
+	}
 	return "  " + labelStyle.Render(label) + "  " + valueStyle.Render(value) + "\n"
 }
 
-func kvInner(label, value string) string {
+func (m Model) kvInner(label, value string) string {
+	if m.asciiOnly {
+		return "  " + rightPad(label, 12) + "  " + value + "\n"
+	}
 	l := lipgloss.NewStyle().Foreground(slate).Width(12)
 	return "  " + l.Render(label) + "  " + valueStyle.Render(value) + "\n"
 }
@@ -513,9 +591,9 @@ func hint(text string) string {
 	return "\n" + hintStyle.Render("  "+text) + "\n"
 }
 
-func drawProgressBar(width int, progress, total int64) string {
+func (m Model) drawProgressBar(width int, progress, total int64) string {
 	if total <= 0 {
-		return barEmptyStyle.Render(strings.Repeat("-", width))
+		return "[" + strings.Repeat("-", width) + "]"
 	}
 	ratio := float64(progress) / float64(total)
 	if ratio > 1.0 {
@@ -531,14 +609,105 @@ func drawProgressBar(width int, progress, total int64) string {
 		empty = 0
 	}
 
-	var bar strings.Builder
-	if filled > 0 {
-		bar.WriteString(barFilledStyle.Render(strings.Repeat("=", filled)))
+	filledText := strings.Repeat("#", filled)
+	emptyText := strings.Repeat("-", empty)
+	if !m.asciiOnly {
+		filledText = barFilledStyle.Render(filledText)
+		emptyText = barEmptyStyle.Render(emptyText)
 	}
-	if empty > 0 {
-		bar.WriteString(barEmptyStyle.Render(strings.Repeat("-", empty)))
+	return "[" + filledText + emptyText + "]"
+}
+
+func (m Model) renderValue(value string) string {
+	if m.asciiOnly {
+		return value
 	}
-	return bar.String()
+	return valueStyle.Render(value)
+}
+
+func (m Model) progressWidth() int {
+	width := 40
+	if m.width > 0 {
+		width = m.width - 34
+	}
+	if width < 12 {
+		return 12
+	}
+	if width > 46 {
+		return 46
+	}
+	return width
+}
+
+func (m Model) box(content string, isError bool) string {
+	lines := strings.Split(strings.TrimRight(content, "\n"), "\n")
+	inner := 72
+	if m.width > 0 {
+		inner = m.width - 6
+	}
+	if inner < 36 {
+		inner = 36
+	}
+	if inner > 84 {
+		inner = 84
+	}
+
+	var b strings.Builder
+	b.WriteString("+" + strings.Repeat("-", inner+2) + "+\n")
+	for _, line := range lines {
+		plain := stripANSI(line)
+		if len(plain) > inner {
+			line = m.fit(plain, inner)
+			plain = line
+		}
+		b.WriteString("| " + line + strings.Repeat(" ", inner-len(plain)) + " |\n")
+	}
+	b.WriteString("+" + strings.Repeat("-", inner+2) + "+")
+
+	if m.asciiOnly {
+		return b.String()
+	}
+	if isError {
+		return errorBoxStyle.Render(content)
+	}
+	return successBoxStyle.Render(content)
+}
+
+func (m Model) fit(value string, limit int) string {
+	if limit <= 0 || len(value) <= limit {
+		return value
+	}
+	if limit <= 3 {
+		return value[:limit]
+	}
+	return value[:limit-3] + "..."
+}
+
+func rightPad(value string, width int) string {
+	if len(value) >= width {
+		return value
+	}
+	return value + strings.Repeat(" ", width-len(value))
+}
+
+func stripANSI(value string) string {
+	var b strings.Builder
+	inEsc := false
+	for i := 0; i < len(value); i++ {
+		c := value[i]
+		if inEsc {
+			if (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') {
+				inEsc = false
+			}
+			continue
+		}
+		if c == 0x1b {
+			inEsc = true
+			continue
+		}
+		b.WriteByte(c)
+	}
+	return b.String()
 }
 
 func formatBytes(b int64) string {

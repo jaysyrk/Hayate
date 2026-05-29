@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"flag"
 	"fmt"
 	"net"
 	"os"
@@ -17,6 +16,7 @@ import (
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/mattn/go-isatty"
+	"github.com/spf13/pflag"
 )
 
 const logo = `
@@ -68,6 +68,7 @@ func printUsage() {
 	fmt.Println("Flags (send):")
 	fmt.Println("  --peer <ip:port>    Direct connect (skip mDNS)")
 	fmt.Println("  --duration <dur>    Discovery scan time (default 3s)")
+	fmt.Println("  --compress <mode>   Compression mode: auto, always, never (default auto)")
 	fmt.Println("  --no-tui            Headless mode")
 	fmt.Println()
 	fmt.Println("Flags (receive):")
@@ -83,9 +84,10 @@ func printUsage() {
 }
 
 func handleSend() {
-	sendCmd := flag.NewFlagSet("send", flag.ExitOnError)
+	sendCmd := pflag.NewFlagSet("send", pflag.ExitOnError)
 	peerFlag := sendCmd.String("peer", "", "Target peer address (e.g. 192.168.1.50:50001)")
 	durationFlag := sendCmd.Duration("duration", 3*time.Second, "Scan duration for peer discovery")
+	compressFlag := sendCmd.String("compress", transfer.CompressAuto, "Compression mode: auto, always, never")
 	noTuiFlag := sendCmd.Bool("no-tui", false, "Disable interactive TUI")
 
 	_ = sendCmd.Parse(os.Args[2:])
@@ -93,7 +95,12 @@ func handleSend() {
 	args := sendCmd.Args()
 	if len(args) < 1 {
 		fmt.Println("Error: file path required")
-		fmt.Println("Usage: hayate send <file> [--peer ip:port] [--no-tui]")
+		fmt.Println("Usage: hayate send <file> [--peer ip:port] [--compress auto|always|never] [--no-tui]")
+		os.Exit(1)
+	}
+	compressMode, ok := transfer.NormalizeCompressionMode(*compressFlag)
+	if !ok {
+		fmt.Printf("Error: invalid --compress mode %q; expected auto, always, or never\n", *compressFlag)
 		os.Exit(1)
 	}
 
@@ -116,13 +123,13 @@ func handleSend() {
 	defer cancel()
 
 	if *noTuiFlag || !isatty.IsTerminal(os.Stdout.Fd()) {
-		runSenderHeadless(ctx, absPath, *peerFlag, *durationFlag)
+		runSenderHeadless(ctx, absPath, *peerFlag, *durationFlag, compressMode)
 		return
 	}
 
 	localIP := network.GetLocalIP()
 	model := tui.NewModel(ctx, cancel, "send", absPath, *peerFlag, 0, localIP, "")
-	go runSenderOrchestrator(ctx, &model, absPath, *peerFlag, *durationFlag)
+	go runSenderOrchestrator(ctx, &model, absPath, *peerFlag, *durationFlag, compressMode)
 
 	p := tea.NewProgram(model)
 	if _, err := p.Run(); err != nil {
@@ -132,7 +139,7 @@ func handleSend() {
 }
 
 func handleReceive() {
-	recvCmd := flag.NewFlagSet("receive", flag.ExitOnError)
+	recvCmd := pflag.NewFlagSet("receive", pflag.ExitOnError)
 	portFlag := recvCmd.Int("port", 50001, "Listen port (0 = random)")
 	nameFlag := recvCmd.String("name", "", "mDNS display name")
 	noTuiFlag := recvCmd.Bool("no-tui", false, "Disable interactive TUI")
@@ -174,7 +181,7 @@ func handleReceive() {
 }
 
 func handleDiscover() {
-	discoverCmd := flag.NewFlagSet("discover", flag.ExitOnError)
+	discoverCmd := pflag.NewFlagSet("discover", pflag.ExitOnError)
 	durationFlag := discoverCmd.Duration("duration", 3*time.Second, "Scan duration")
 	_ = discoverCmd.Parse(os.Args[2:])
 
@@ -217,6 +224,20 @@ func resolveOutputPath(outputDir, filename string) string {
 			return candidate
 		}
 	}
+}
+
+func sanitizeRemoteFilename(filename string) (string, error) {
+	if filename == "" {
+		return "", fmt.Errorf("empty filename")
+	}
+	if strings.ContainsAny(filename, `/\`) {
+		return "", fmt.Errorf("filename contains path separators")
+	}
+	base := filepath.Base(filename)
+	if base != filename || base == "." || base == ".." {
+		return "", fmt.Errorf("unsafe filename")
+	}
+	return base, nil
 }
 
 // -- Headless Output Primitives --
@@ -291,7 +312,7 @@ func formatBytes(b int64) string {
 
 // -- TUI Orchestrators --
 
-func runSenderOrchestrator(ctx context.Context, m *tui.Model, filePath string, peerAddr string, scanDuration time.Duration) {
+func runSenderOrchestrator(ctx context.Context, m *tui.Model, filePath string, peerAddr string, scanDuration time.Duration, compressMode string) {
 	stat, err := os.Stat(filePath)
 	if err != nil {
 		m.MsgChan <- tui.ErrorMsg{Err: fmt.Errorf("stat: %w", err)}
@@ -343,12 +364,12 @@ func runSenderOrchestrator(ctx context.Context, m *tui.Model, filePath string, p
 	}
 
 	select {
-	case m.MsgChan <- tui.StartTransferMsg{FileName: filename, FileSize: fileSize, IsSend: true, PeerAddr: targetAddr}:
+	case m.MsgChan <- tui.StartTransferMsg{FileName: filename, FileSize: fileSize, IsSend: true, PeerAddr: targetAddr, LocalAddr: conn.LocalAddr().String()}:
 	case <-ctx.Done():
 		return
 	}
 
-	hash, err := transfer.SendFile(ctx, filePath, stream, key, func(p int64) {
+	hash, err := transfer.SendFile(ctx, filePath, stream, key, compressMode, func(p int64) {
 		select {
 		case m.MsgChan <- tui.ProgressMsg(p):
 		default:
@@ -419,13 +440,19 @@ func runReceiverOrchestrator(ctx context.Context, m *tui.Model, listenPort int, 
 		return
 	}
 
+	safeFilename, err := sanitizeRemoteFilename(filename)
+	if err != nil {
+		m.MsgChan <- tui.ErrorMsg{Err: fmt.Errorf("metadata: %w", err)}
+		return
+	}
+
 	select {
-	case m.MsgChan <- tui.StartTransferMsg{FileName: filename, FileSize: fileSize, IsSend: false, PeerAddr: peerAddr}:
+	case m.MsgChan <- tui.StartTransferMsg{FileName: safeFilename, FileSize: fileSize, IsSend: false, PeerAddr: peerAddr, LocalAddr: listener.Addr().String()}:
 	case <-ctx.Done():
 		return
 	}
 
-	outPath := resolveOutputPath(outputDir, filename)
+	outPath := resolveOutputPath(outputDir, safeFilename)
 	hash, err := transfer.ReceiveFile(ctx, outPath, stream, key, fileSize, func(p int64) {
 		select {
 		case m.MsgChan <- tui.ProgressMsg(p):
@@ -445,7 +472,7 @@ func runReceiverOrchestrator(ctx context.Context, m *tui.Model, listenPort int, 
 
 // -- Headless Flows --
 
-func runSenderHeadless(ctx context.Context, filePath string, peerAddr string, scanDuration time.Duration) {
+func runSenderHeadless(ctx context.Context, filePath string, peerAddr string, scanDuration time.Duration, compressMode string) {
 	printBanner()
 
 	stat, err := os.Stat(filePath)
@@ -495,10 +522,11 @@ func runSenderHeadless(ctx context.Context, filePath string, peerAddr string, sc
 	done("Secure channel established")
 
 	step("Sending %s...", filename)
+	step("Compression: %s", compressMode)
 	startTime := time.Now()
 	lastPrint := time.Now()
 
-	hash, err := transfer.SendFile(ctx, filePath, stream, key, func(progress int64) {
+	hash, err := transfer.SendFile(ctx, filePath, stream, key, compressMode, func(progress int64) {
 		now := time.Now()
 		if now.Sub(lastPrint) < 200*time.Millisecond {
 			return
@@ -596,11 +624,15 @@ func runReceiverHeadless(ctx context.Context, listenPort int, advertisedName str
 	if err != nil {
 		fail("Handshake failed: %v", err)
 	}
+	safeFilename, err := sanitizeRemoteFilename(filename)
+	if err != nil {
+		fail("Unsafe remote filename: %v", err)
+	}
 	done("Secure channel established")
 
-	step("Receiving: %s (%s)", filename, formatBytes(fileSize))
+	step("Receiving: %s (%s)", safeFilename, formatBytes(fileSize))
 
-	outPath := resolveOutputPath(outputDir, filename)
+	outPath := resolveOutputPath(outputDir, safeFilename)
 
 	startTime := time.Now()
 	lastPrint := time.Now()

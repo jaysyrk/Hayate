@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"math/big"
 	"net"
+	"os"
 	"runtime"
 	"strings"
 	"time"
@@ -93,12 +94,19 @@ func highThroughputQUICConfig() *quic.Config {
 		MaxConnectionReceiveWindow:     128 * 1024 * 1024,
 	}
 
-	// Android Termux may drop QUIC PMTU probe packets; disable discovery to prevent stalls
-	if runtime.GOOS == "android" {
+	// Android and Termux environments may drop QUIC PMTU probe packets.
+	if isAndroid() {
 		cfg.DisablePathMTUDiscovery = true
 	}
 
 	return cfg
+}
+
+func isAndroid() bool {
+	if runtime.GOOS == "android" {
+		return true
+	}
+	return strings.Contains(strings.ToLower(os.Getenv("PREFIX")), "com.termux")
 }
 
 func StartAdvertising(ctx context.Context, name string, port int) (*zeroconf.Server, error) {

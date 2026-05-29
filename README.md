@@ -1,140 +1,236 @@
-# Hayate (疾風)
+# Hayate
 
-Hayate is a high-performance, secure, and zero-allocation cross-device CLI file transfer utility written in Go. Engineered with mechanical sympathy, it utilizes a custom-built parallel pipeline combining real-time **zstd compression** with **ChaCha20-Poly1305 AEAD** encryption, streamed over multiplexed **QUIC (UDP)** transport.
+Fast encrypted file transfer for local networks, terminals, scripts, and Termux.
 
 ```text
-    __ __                 __    
+    __ __                 __
    / // /___ ___ __ ___ _/ /____
-  / _  / _ \'/ // / _ \'/ __/ -_)
- /_//_/\_,_/\_, /\_,_/\__/\___/ 
-           /___/                
+  / _  / _ '/ // / _ '/ __/ -_)
+ /_//_/\_,_/\_, /\_,_/\__/\___/
+           /___/
 ```
 
----
+Hayate is a single-binary Go CLI for sending files between machines over QUIC. It uses an ephemeral X25519 key exchange, ChaCha20-Poly1305 authenticated encryption, optional zstd compression, mDNS discovery, and a terminal UI that falls back cleanly to ASCII output for scripts and mobile terminals.
 
-## Key Features
+Current project version: **v2.0.0**.
 
-* **Zero-Allocation Cryptography**: Utilizes ephemeral X25519 Curve25519 ECDH handshakes for session key agreement. Payload encryption is executed in-place directly into recycled buffers, bypassing heap allocations on the hot path.
-* **Multiplexed UDP Transport**: Bypasses TCP congestion overheads using `quic-go`, securing connections with short-lived TLS configurations generated purely in-memory.
-* **Real-time Compressed Sharding**: Implements real-time parallel zstd compression (`klauspost/compress/zstd`) aligned to your CPU core topology.
-* **Resilient Peer Discovery**: Scans local networks using multicast DNS (mDNS). Features a graceful fallback to direct IP transfers on restricted mobile environments (like Android Termux) where UDP multicast is blocked.
-* **Gorgeous ASCII TUI**: A highly polished, emoji-free Terminal User Interface powered by Charm Bracelet (`bubbletea` and `lipgloss`) utilizing HSL hex palettes designed for dark modes.
-* **Headless/Pipeline Friendly**: Automatically detects non-TTY environments (e.g., standard streams, cron, SSH scripts) and falls back to a clean plain-text progress layout.
+This is the first open-source-ready protocol version. It introduces the v2 frame format with per-frame raw/zstd flags, adaptive compression, hardened metadata bounds, Termux-specific QUIC behavior, and strict remote filename sanitization.
 
----
+## Features
 
-## Architecture Overview
+- Encrypted by default with ephemeral X25519 session keys and ChaCha20-Poly1305 frames.
+- QUIC transport over UDP using `quic-go`.
+- Adaptive compression with `--compress auto`, `--compress always`, or `--compress never`.
+- mDNS discovery for LAN receivers, with direct `--peer ip:port` mode for restricted networks.
+- Termux-friendly direct connection flow and Path MTU discovery handling.
+- ASCII-safe headless output for SSH, CI, scripts, narrow terminals, and non-color terminals.
+- SHA-256 verification shown after every completed transfer.
+- Single static release binaries for macOS, Linux, Windows, and Termux targets.
 
-```mermaid
-sequenceDiagram
-    autonumber
-    participant Sender as Hayate (Sender)
-    participant Receiver as Hayate (Receiver)
-    
-    Note over Sender,Receiver: Ephemeral ECDH Key Exchange & Handshake
-    Sender->>Receiver: Write Ephemeral X25519 Public Key (32B)
-    Receiver->>Sender: Write Ephemeral X25519 Public Key (32B)
-    Note over Sender: Derive Session Key
-    Note over Receiver: Derive Session Key
-    
-    Note over Sender,Receiver: Secure Metadata Exchange
-    Sender->>Receiver: Encrypted Metadata Packet (Filename, Raw Size)
-    
-    Note over Sender,Receiver: High-Throughput Pipeline (1MB Chunks)
-    rect rgb(30, 30, 46)
-        Note over Sender: Read file -> Compress (zstd) -> Encrypt (ChaCha20-Poly1305)
-        Sender->>Receiver: Write [Length Frame (4B)] + [Encrypted Chunk Payload]
-        Note over Receiver: Decrypt (In-place) -> Decompress -> Write to Disk
-    end
-    
-    Note over Sender,Receiver: Socket Close & Completion Sync
-    Sender->>Receiver: stream.Close() (FIN)
-    Note over Receiver: Calculate Final SHA-256 Hash
-    Receiver->>Sender: stream.Close() (FIN)
-    Note over Sender: Unblocks dummy read & exit
+## Security Model
+
+Hayate protects file contents in transit against passive network observers.
+
+- Each connection negotiates a fresh X25519 shared secret.
+- Payloads are authenticated and encrypted with ChaCha20-Poly1305.
+- Metadata is encrypted before transfer.
+- Incoming filenames are sanitized before writing to disk.
+- Frame and metadata sizes are bounded before allocation.
+- Release artifacts include SHA-256 checksums.
+
+Hayate does not currently provide persistent peer identity or certificate pinning. Use direct `--peer` addresses on trusted local networks.
+
+## Install
+
+Download a release archive from the project releases page, then verify the checksum:
+
+```bash
+sha256sum -c SHA256SUMS
 ```
 
----
+On macOS:
 
-## Installation & Releases
+```bash
+shasum -a 256 -c SHA256SUMS
+```
 
-Download the complete pre-compiled static releases package:
+Make the binary executable:
 
-* **Archive Download**: [hayate-releases.zip](file:///Users/saksham/Projects/Hayate/hayate-releases.zip)
+```bash
+chmod +x hayate-linux-amd64
+./hayate-linux-amd64 version
+```
 
-### SHA-256 Checksums
+For Termux, use the Linux arm64/Termux build:
 
-To verify the integrity of your download:
+```bash
+chmod +x hayate-termux-arm64
+./hayate-termux-arm64 receive --no-tui --port 50001
+```
+
+## Quick Start
+
+Start a receiver:
+
+```bash
+hayate receive --port 50001 --output ~/Downloads
+```
+
+Send a file using direct mode:
+
+```bash
+hayate send ./video.mp4 --peer 192.168.1.50:50001
+```
+
+Send a file and disable compression:
+
+```bash
+hayate send ./archive.zip --peer 192.168.1.50:50001 --compress never
+```
+
+Discover receivers on the LAN:
+
+```bash
+hayate discover --duration 5s
+```
+
+Use headless mode for Termux, SSH, and scripts:
+
+```bash
+hayate receive --port 50001 --output . --no-tui
+hayate send ./file.bin --peer 192.168.1.50:50001 --no-tui
+```
+
+## Commands
 
 ```text
-a80aa3bb4ba98fe5e8b9df6ebf794920dceee53d08deab4c195278544a582226  hayate-releases.zip
-d2bb77ddc30c46925adb8ef8cb16d36cc41329a7a5ec7fdeccd473520f85f220  hayate-android-arm64
-359cd59b447fdeb0e9170da977470c085a387ec2cbf4ac2be9a45e2bc7399174  hayate-darwin-arm64
-bd8acffaab7b4aadbc1dd5d3f7f37074e246375dcee5f0295d926340d3a85394  hayate-darwin-amd64
-570250e38ef436d1fb7c6fcf8d6214104ff745b74484d2d809f33e89d060cee1  hayate-linux-amd64
-ae455db2ee9a19a2a5441adb5797318ab706a32ae33a8876799b8bc3a9ca118e  hayate-linux-arm64
+hayate send <file> [--peer ip:port] [--duration 3s] [--compress auto|always|never] [--no-tui]
+hayate receive [--port 50001] [--name name] [--output dir] [--no-tui]
+hayate discover [--duration 3s]
+hayate version
 ```
 
----
-
-## Usage Guide
-
-### 1. Receive Mode (Listening for Files)
-Binds to a port and waits for incoming file transfers. 
+Flags may be placed before or after positional arguments:
 
 ```bash
-# Launch interactive TUI receiver
-./hayate-darwin-arm64 receive --port 50001
-
-# Launch plain-text headless receiver (recommended for Termux/Scripts)
-./hayate-android-arm64 receive --port 50001 --no-tui
+hayate send ./file.bin --peer 192.168.1.50:50001 --compress auto
+hayate send --peer 192.168.1.50:50001 --compress auto ./file.bin
 ```
 
-*When the receiver launches, it prints its local IP address and port (e.g. `192.168.1.3:50001`). Copy this address for the sender.*
+## Compression Modes
 
-### 2. Send Mode (Transmitting Files)
-Encrypts, compresses, and transmits a file.
+`auto` is the default. It skips known incompressible file types and also sends individual chunks raw when zstd does not reduce their size.
+
+```text
+auto    Use extension and per-chunk heuristics.
+always  Force zstd frames.
+never   Send raw encrypted frames.
+```
+
+Recommended choices:
+
+```text
+Photos, videos, APKs, ZIP/RAR/7z, PDFs:  --compress never or auto
+Text, CSV, JSON, logs, source trees:     --compress auto
+Known compressible backups:              --compress always
+```
+
+## Termux Notes
+
+Android and Termux often restrict multicast discovery. Prefer direct mode:
 
 ```bash
-# Send a file utilizing local mDNS peer discovery
-./hayate-darwin-arm64 send my_archive.tar.gz
+# Phone
+./hayate-termux-arm64 receive --port 50001 --output ~/storage/downloads --no-tui
 
-# Send a file directly by bypassing discovery (bypasses mDNS interface limits)
-./hayate-darwin-arm64 send --peer 192.168.1.3:50001 my_archive.tar.gz
-
-# Send a file in plain-text headless mode
-./hayate-darwin-arm64 send --peer 192.168.1.3:50001 --no-tui my_archive.tar.gz
+# Computer
+./hayate send ./file.bin --peer PHONE_IP:50001 --no-tui --compress auto
 ```
 
-### 3. Discover Mode (Network Scan)
-Queries the local multicast DNS subnet for other active Hayate peers.
+If mDNS discovery fails, it is usually a network or Android multicast restriction. Direct `--peer` mode is the reliable path.
+
+## Build From Source
+
+Requirements:
+
+- Go 1.22 or newer.
+- `zip` is optional; `tar.gz` archives are always produced by the release script.
+
+Run tests:
 
 ```bash
-./hayate-darwin-arm64 discover --duration 5s
+go test ./...
+go test -race ./...
 ```
 
----
-
-## Performance Tuning Details
-
-Hayate is optimized for high-bandwidth local connections (Wi-Fi 6, 10Gbps Ethernet, loopback):
-1. **Memory Allocation**: Custom read buffers (1MB chunks) are pooled via `sync.Pool`. Memory pressure is nearly static, keeping Go GC pauses to under 1ms.
-2. **CPU Sympathy**: Encryption and compression worker thread pools are sized explicitly to system core topology, with `zstd` limited to single-thread scaling per chunk to avoid thread-oversubscription lock contention.
-3. **Pipeline Synchronization**: Uses cooperative FIN-stream handshakes to prevent socket teardown before the receiver has successfully flushed chunks to storage.
-
----
-
-## Building from Source
-
-Ensure you have **Go 1.22+** installed:
+Build a local binary:
 
 ```bash
-# Clone the repository
-git clone https://github.com/shiinasaku/hayate.git && cd hayate
-
-# Run unit tests
-go test -v -race ./...
-
-# Compile optimized static release binaries
-CGO_ENABLED=0 go build -ldflags="-s -w" -o hayate ./cmd/hayate
+CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o hayate ./cmd/hayate
 ```
+
+Build release artifacts:
+
+```bash
+scripts/release.sh
+```
+
+Run race tests during release:
+
+```bash
+HAYATE_RELEASE_RACE=1 scripts/release.sh
+```
+
+Optionally upload release archives over SSH:
+
+```bash
+HAYATE_RELEASE_SSH_TARGET=user@example.com:/var/www/releases/ scripts/release.sh
+```
+
+Artifacts are written to:
+
+```text
+dist/hayate-v2.0.0/
+dist/hayate-v2.0.0.tar.gz
+dist/hayate-v2.0.0.tar.gz.sha256
+dist/hayate-v2.0.0.zip
+dist/hayate-v2.0.0.zip.sha256
+```
+
+## Release Targets
+
+The release script builds:
+
+```text
+hayate-darwin-amd64
+hayate-darwin-arm64
+hayate-linux-amd64
+hayate-linux-arm64
+hayate-termux-arm64
+hayate-windows-amd64.exe
+hayate-windows-arm64.exe
+```
+
+## Protocol Compatibility
+
+v2.0.0 is not wire-compatible with v1.x peers because encrypted payload frames now include a compression flag.
+
+Both sender and receiver should run the same major version.
+
+## Contributing
+
+Keep changes small, tested, and security-conscious.
+
+Before opening a pull request:
+
+```bash
+gofmt -w .
+go test ./...
+go test -race ./...
+```
+
+Report security issues privately until a fix is available.
+
+## License
+
+MIT. See [LICENSE](LICENSE).
