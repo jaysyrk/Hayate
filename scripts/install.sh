@@ -56,10 +56,11 @@ else
 fi
 
 log_info "Fetching latest release metadata..."
-LATEST_TAG=$(curl -sL "https://api.github.com/repos/${REPO}/releases/latest" | grep '"tag_name":' | sed -E 's/.*"([^"]+)".*/\1/')
+# Rate-limit proof: Bypasses API entirely and extracts tag from redirect URL
+LATEST_TAG=$(curl -sLI -o /dev/null -w "%{url_effective}" "https://github.com/${REPO}/releases/latest" | sed 's|.*/||')
 
-if [ -z "$LATEST_TAG" ]; then
-    log_error "Failed to fetch the latest release tag from GitHub."
+if [ -z "$LATEST_TAG" ] || [ "$LATEST_TAG" = "latest" ]; then
+    log_error "Failed to fetch the latest release tag. Check repository visibility."
 fi
 
 ASSET_NAME="${BINARY_NAME}-${OS_TARGET}-${ARCH_TARGET}"
