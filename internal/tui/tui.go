@@ -29,6 +29,11 @@ const (
 
 type PeerDiscoveredMsg []network.Peer
 
+type ListeningMsg struct {
+	Port      int
+	LocalAddr string
+}
+
 type StartTransferMsg struct {
 	FileName  string
 	FileSize  int64
@@ -188,6 +193,7 @@ type Model struct {
 	startTime    time.Time
 	lastTime     time.Time
 	lastProgress int64
+	lastSpeed    float64
 	speed        float64
 	eta          time.Duration
 	hash         string
@@ -273,7 +279,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if m.state == StateSelectPeer && len(m.peers) > 0 {
 				selected := m.peers[m.selectedIdx]
 				m.state = StateHandshake
-				m.peerAddr = fmt.Sprintf("%s:%d", selected.IP, selected.Port)
+				m.peerAddr = network.FormatAddress(selected.IP, selected.Port)
 				select {
 				case m.SelectedPeerChan <- selected:
 				default:
@@ -297,6 +303,12 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.state = StateSelectPeer
 		}
 
+	case ListeningMsg:
+		m.port = msg.Port
+		if msg.LocalAddr != "" {
+			m.localAddr = msg.LocalAddr
+		}
+
 	case StartTransferMsg:
 		m.state = StateTransferring
 		m.fileName = msg.FileName
@@ -310,10 +322,17 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		m.startTime = time.Now()
 		m.lastTime = m.startTime
+		m.progress = 0
 		m.lastProgress = 0
+		m.lastSpeed = 0
+		m.speed = 0
+		m.eta = 0
 
 	case ProgressMsg:
 		curr := int64(msg)
+		if curr < m.progress {
+			curr = m.progress
+		}
 		m.progress = curr
 		now := time.Now()
 		elapsed := now.Sub(m.lastTime)
@@ -322,10 +341,15 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			bytesDelta := curr - m.lastProgress
 			instSpeed := float64(bytesDelta) / elapsed.Seconds()
 
-			if m.speed == 0 {
-				m.speed = instSpeed
+			if m.lastSpeed == 0 {
+				m.lastSpeed = instSpeed
 			} else {
-				m.speed = m.speed*0.65 + instSpeed*0.35
+				m.lastSpeed = m.lastSpeed*0.55 + instSpeed*0.45
+			}
+			totalElapsed := now.Sub(m.startTime).Seconds()
+			if totalElapsed > 0 {
+				avgSpeed := float64(curr) / totalElapsed
+				m.speed = avgSpeed*0.65 + m.lastSpeed*0.35
 			}
 			m.lastTime = now
 			m.lastProgress = curr
@@ -351,7 +375,10 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 	}
 
-	cmds = append(cmds, m.WaitForMsg())
+	switch msg.(type) {
+	case PeerDiscoveredMsg, ListeningMsg, StartTransferMsg, ProgressMsg, DoneMsg, ErrorMsg:
+		cmds = append(cmds, m.WaitForMsg())
+	}
 	return m, tea.Batch(cmds...)
 }
 
@@ -408,7 +435,11 @@ func (m Model) viewDiscover() string {
 	if m.Mode == "send" {
 		s.WriteString("Scanning local network for active receivers...\n")
 	} else {
-		s.WriteString(fmt.Sprintf("Listening on %s:%d", m.localIP, m.port))
+		addr := m.localAddr
+		if addr == "" {
+			addr = network.FormatAddress(m.localIP, m.port)
+		}
+		s.WriteString(fmt.Sprintf("Listening on %s", addr))
 		if m.advertised != "" {
 			s.WriteString(fmt.Sprintf("  (advertised as %s)", m.advertised))
 		}
@@ -425,26 +456,28 @@ func (m Model) viewSelectPeer() string {
 	s.WriteString(sectionStyle.Render("[ SELECT PEER ]") + "\n\n")
 
 	// Table header
-	hdr := fmt.Sprintf("    %-20s  %-22s  %s", "NAME", "ADDRESS", "OS")
+	nameW, addrW := m.peerTableWidths()
+	hdr := fmt.Sprintf("    %s  %s  %s", padCell("NAME", nameW), padCell("ADDRESS", addrW), "OS")
 	s.WriteString(tableHeaderStyle.Render(hdr) + "\n")
-	s.WriteString(tableHeaderStyle.Render("    "+strings.Repeat("-", 54)) + "\n")
+	s.WriteString(tableHeaderStyle.Render("    "+strings.Repeat("-", nameW+addrW+14)) + "\n")
 
 	for i, p := range m.peers {
-		addr := fmt.Sprintf("%s:%d", p.IP, p.Port)
+		addr := network.FormatAddress(p.IP, p.Port)
+		name := fitString(p.Name, nameW)
+		osName := fitString(p.OS, 12)
 		if i == m.selectedIdx {
-			line := fmt.Sprintf("  %s %-20s  %-22s  %s",
-				cursorStyle.Render(">"),
-				tableSelectedStyle.Render(p.Name),
-				tableSelectedStyle.Render(addr),
-				tableSelectedStyle.Render(p.OS))
+			line := fmt.Sprintf("  > %s  %s  %s", padCell(name, nameW), padCell(fitString(addr, addrW), addrW), osName)
+			if !m.asciiOnly {
+				line = tableSelectedStyle.Render(line)
+			}
 			s.WriteString(line + "\n")
 		} else {
-			line := fmt.Sprintf("    %-20s  %-22s  %s", p.Name, addr, p.OS)
+			line := fmt.Sprintf("    %s  %s  %s", padCell(name, nameW), padCell(fitString(addr, addrW), addrW), osName)
 			s.WriteString(tableRowStyle.Render(line) + "\n")
 		}
 	}
 
-	s.WriteString(tableHeaderStyle.Render("    "+strings.Repeat("-", 54)) + "\n")
+	s.WriteString(tableHeaderStyle.Render("    "+strings.Repeat("-", nameW+addrW+14)) + "\n")
 	s.WriteString(hint("j/k or Up/Down to navigate  |  Enter to select  |  Esc to cancel"))
 	return s.String()
 }
@@ -480,9 +513,10 @@ func (m Model) viewTransferring() string {
 		pct = float64(m.progress) / float64(m.fileSize) * 100.0
 	}
 
-	s.WriteString(m.kv("File", m.fit(m.fileName, 48)))
+	valueW := m.valueWidth()
+	s.WriteString(m.kv("File", m.fit(m.fileName, valueW)))
 	s.WriteString(m.kv("Size", formatBytes(m.fileSize)))
-	s.WriteString(m.kv("Peer", fmt.Sprintf("%s %s %s", m.localAddr, arrow, m.peerAddr)))
+	s.WriteString(m.kv("Peer", m.fit(fmt.Sprintf("%s %s %s", m.localAddr, arrow, m.peerAddr), valueW)))
 	s.WriteString("\n")
 
 	barWidth := m.progressWidth()
@@ -491,7 +525,7 @@ func (m Model) viewTransferring() string {
 	if !m.asciiOnly {
 		pctStr = pctStyle.Render(pctStr)
 	}
-	speed := formatSpeed(m.speed)
+	speed := m.fit(formatSpeed(m.speed), 12)
 	if !m.asciiOnly {
 		speed = speedStyle.Render(speed)
 	}
@@ -526,7 +560,7 @@ func (m Model) viewCompleted() string {
 		title = successStyle.Render(title)
 	}
 	b.WriteString(title + "\n\n")
-	b.WriteString(m.kvInner("File", m.fit(m.fileName, 48)))
+	b.WriteString(m.kvInner("File", m.fit(m.fileName, m.innerValueWidth())))
 	b.WriteString(m.kvInner("Size", formatBytes(m.fileSize)))
 	hash := m.hash
 	if m.width > 0 && m.width < 92 && len(hash) > 24 {
@@ -628,15 +662,53 @@ func (m Model) renderValue(value string) string {
 func (m Model) progressWidth() int {
 	width := 40
 	if m.width > 0 {
-		width = m.width - 34
+		width = m.width - 32
 	}
 	if width < 12 {
 		return 12
 	}
-	if width > 46 {
-		return 46
+	if width > 50 {
+		return 50
 	}
 	return width
+}
+
+func (m Model) valueWidth() int {
+	width := 48
+	if m.width > 0 {
+		width = m.width - 22
+	}
+	if width < 18 {
+		return 18
+	}
+	if width > 64 {
+		return 64
+	}
+	return width
+}
+
+func (m Model) innerValueWidth() int {
+	width := 48
+	if m.width > 0 {
+		width = m.width - 28
+	}
+	if width < 18 {
+		return 18
+	}
+	if width > 64 {
+		return 64
+	}
+	return width
+}
+
+func (m Model) peerTableWidths() (int, int) {
+	if m.width > 0 && m.width < 64 {
+		return 14, 18
+	}
+	if m.width > 0 && m.width < 84 {
+		return 18, 22
+	}
+	return 24, 28
 }
 
 func (m Model) box(content string, isError bool) string {
@@ -674,13 +746,7 @@ func (m Model) box(content string, isError bool) string {
 }
 
 func (m Model) fit(value string, limit int) string {
-	if limit <= 0 || len(value) <= limit {
-		return value
-	}
-	if limit <= 3 {
-		return value[:limit]
-	}
-	return value[:limit-3] + "..."
+	return fitString(value, limit)
 }
 
 func rightPad(value string, width int) string {
@@ -688,6 +754,41 @@ func rightPad(value string, width int) string {
 		return value
 	}
 	return value + strings.Repeat(" ", width-len(value))
+}
+
+func padCell(value string, width int) string {
+	value = fitString(value, width)
+	if lipgloss.Width(value) >= width {
+		return value
+	}
+	return value + strings.Repeat(" ", width-lipgloss.Width(value))
+}
+
+func fitString(value string, limit int) string {
+	if limit <= 0 || lipgloss.Width(value) <= limit {
+		return value
+	}
+	if limit <= 3 {
+		return truncateCells(value, limit)
+	}
+	return truncateCells(value, limit-3) + "..."
+}
+
+func truncateCells(value string, limit int) string {
+	if limit <= 0 {
+		return ""
+	}
+	var b strings.Builder
+	used := 0
+	for _, r := range value {
+		w := lipgloss.Width(string(r))
+		if used+w > limit {
+			break
+		}
+		b.WriteRune(r)
+		used += w
+	}
+	return b.String()
 }
 
 func stripANSI(value string) string {

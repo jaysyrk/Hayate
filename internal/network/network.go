@@ -31,12 +31,72 @@ type Peer struct {
 }
 
 func GetLocalIP() string {
-	conn, err := net.Dial("udp", "8.8.8.8:80")
-	if err != nil {
-		return "127.0.0.1"
+	ips := GetLocalIPs()
+	if len(ips) > 0 {
+		return ips[0]
 	}
-	defer conn.Close()
-	return conn.LocalAddr().(*net.UDPAddr).IP.String()
+	return "127.0.0.1"
+}
+
+func GetLocalIPs() []string {
+	var v4 []string
+	var v6 []string
+	ifaces, err := net.Interfaces()
+	if err != nil {
+		return nil
+	}
+	for _, iface := range ifaces {
+		if iface.Flags&net.FlagUp == 0 || iface.Flags&net.FlagLoopback != 0 {
+			continue
+		}
+		addrs, err := iface.Addrs()
+		if err != nil {
+			continue
+		}
+		for _, addr := range addrs {
+			ip := ipFromAddr(addr)
+			if ip == nil {
+				continue
+			}
+			if ip4 := ip.To4(); ip4 != nil && isPrivateIPv4(ip4) {
+				v4 = append(v4, ip4.String())
+				continue
+			}
+			if ip16 := ip.To16(); ip16 != nil && ip.To4() == nil && isPreferredIPv6(ip16) {
+				v6 = append(v6, ip16.String())
+			}
+		}
+	}
+	return append(v4, v6...)
+}
+
+func ipFromAddr(addr net.Addr) net.IP {
+	switch v := addr.(type) {
+	case *net.IPNet:
+		return v.IP
+	case *net.IPAddr:
+		return v.IP
+	default:
+		return nil
+	}
+}
+
+func isPrivateIPv4(ip net.IP) bool {
+	if len(ip) != net.IPv4len {
+		return false
+	}
+	return ip[0] == 10 ||
+		(ip[0] == 172 && ip[1] >= 16 && ip[1] <= 31) ||
+		(ip[0] == 192 && ip[1] == 168) ||
+		(ip[0] == 169 && ip[1] == 254)
+}
+
+func isPreferredIPv6(ip net.IP) bool {
+	return ip.IsGlobalUnicast() && !ip.IsLinkLocalUnicast() && !ip.IsLoopback()
+}
+
+func FormatAddress(host string, port int) string {
+	return net.JoinHostPort(host, fmt.Sprintf("%d", port))
 }
 
 func GenerateTLSConfig() (*tls.Config, error) {
@@ -81,17 +141,20 @@ func GenerateTLSConfig() (*tls.Config, error) {
 	}, nil
 }
 
-// highThroughputQUICConfig returns a quic.Config tuned for maximum throughput.
-// Stream windows are expanded to 16MB/64MB and connection windows to 32MB/128MB
-// to prevent flow-control throttling on high-bandwidth LAN and Wi-Fi 6E links.
+// highThroughputQUICConfig returns a quic.Config tuned for maximum LAN throughput.
+// Large flow-control windows keep Wi-Fi 6/6E and wired LAN paths saturated when
+// disk and CPU can keep up.
 func highThroughputQUICConfig() *quic.Config {
 	cfg := &quic.Config{
 		MaxIdleTimeout:                 60 * time.Second,
 		KeepAlivePeriod:                15 * time.Second,
-		InitialStreamReceiveWindow:     16 * 1024 * 1024,
-		MaxStreamReceiveWindow:         64 * 1024 * 1024,
-		InitialConnectionReceiveWindow: 32 * 1024 * 1024,
-		MaxConnectionReceiveWindow:     128 * 1024 * 1024,
+		HandshakeIdleTimeout:           10 * time.Second,
+		InitialStreamReceiveWindow:     32 * 1024 * 1024,
+		MaxStreamReceiveWindow:         256 * 1024 * 1024,
+		InitialConnectionReceiveWindow: 64 * 1024 * 1024,
+		MaxConnectionReceiveWindow:     512 * 1024 * 1024,
+		MaxIncomingStreams:             8,
+		MaxIncomingUniStreams:          8,
 	}
 
 	// Android and Termux environments may drop QUIC PMTU probe packets.
@@ -115,7 +178,7 @@ func StartAdvertising(ctx context.Context, name string, port int) (*zeroconf.Ser
 		"app=Hayate",
 	}
 
-	server, err := zeroconf.Register(name, ServiceType, "local.", port, txt, nil)
+	server, err := zeroconf.Register(name, ServiceType, "local.", port, txt, multicastInterfaces())
 	if err != nil {
 		return nil, fmt.Errorf("registering zeroconf mdns: %w", err)
 	}
@@ -123,7 +186,10 @@ func StartAdvertising(ctx context.Context, name string, port int) (*zeroconf.Ser
 }
 
 func DiscoverPeers(ctx context.Context, scanDuration time.Duration) ([]Peer, error) {
-	resolver, err := zeroconf.NewResolver()
+	resolver, err := zeroconf.NewResolver(
+		zeroconf.SelectIPTraffic(zeroconf.IPv4AndIPv6),
+		zeroconf.SelectIfaces(multicastInterfaces()),
+	)
 	if err != nil {
 		if IsMulticastError(err) {
 			return nil, fmt.Errorf("multicast UDP is not supported on this network interface. Use --peer <ip:port> to connect directly")
@@ -132,15 +198,23 @@ func DiscoverPeers(ctx context.Context, scanDuration time.Duration) ([]Peer, err
 	}
 
 	entries := make(chan *zeroconf.ServiceEntry)
+	browseErr := make(chan error, 1)
 	var peers []Peer
 
 	go func() {
-		_ = resolver.Browse(ctx, ServiceType, "local.", entries)
+		browseErr <- resolver.Browse(ctx, ServiceType, "local.", entries)
 	}()
 
 	timeout := time.After(scanDuration)
 	for {
 		select {
+		case err := <-browseErr:
+			if err != nil {
+				if IsMulticastError(err) {
+					return peers, fmt.Errorf("multicast UDP is not supported on this network interface. Use --peer <ip:port> to connect directly")
+				}
+				return peers, fmt.Errorf("browsing mdns: %w", err)
+			}
 		case entry, ok := <-entries:
 			if !ok {
 				return peers, nil
@@ -158,11 +232,9 @@ func DiscoverPeers(ctx context.Context, scanDuration time.Duration) ([]Peer, err
 			}
 
 			if isHayate {
-				ip := "127.0.0.1"
-				if len(entry.AddrIPv4) > 0 {
-					ip = entry.AddrIPv4[0].String()
-				} else if len(entry.AddrIPv6) > 0 {
-					ip = entry.AddrIPv6[0].String()
+				ip := bestServiceIP(entry)
+				if ip == "" {
+					continue
 				}
 
 				peers = append(peers, Peer{
@@ -181,13 +253,66 @@ func DiscoverPeers(ctx context.Context, scanDuration time.Duration) ([]Peer, err
 	}
 }
 
+func multicastInterfaces() []net.Interface {
+	ifaces, err := net.Interfaces()
+	if err != nil {
+		return nil
+	}
+	selected := make([]net.Interface, 0, len(ifaces))
+	for _, iface := range ifaces {
+		if iface.Flags&net.FlagUp == 0 ||
+			iface.Flags&net.FlagLoopback != 0 ||
+			iface.Flags&net.FlagMulticast == 0 {
+			continue
+		}
+		if hasUsableIP(iface) {
+			selected = append(selected, iface)
+		}
+	}
+	if len(selected) == 0 {
+		return nil
+	}
+	return selected
+}
+
+func hasUsableIP(iface net.Interface) bool {
+	addrs, err := iface.Addrs()
+	if err != nil {
+		return false
+	}
+	for _, addr := range addrs {
+		ip := ipFromAddr(addr)
+		if ip == nil {
+			continue
+		}
+		if ip.To4() != nil || isPreferredIPv6(ip) {
+			return true
+		}
+	}
+	return false
+}
+
+func bestServiceIP(entry *zeroconf.ServiceEntry) string {
+	for _, ip := range entry.AddrIPv4 {
+		if ip4 := ip.To4(); ip4 != nil {
+			return ip4.String()
+		}
+	}
+	for _, ip := range entry.AddrIPv6 {
+		if ip16 := ip.To16(); ip16 != nil && ip.To4() == nil && isPreferredIPv6(ip16) {
+			return ip16.String()
+		}
+	}
+	return ""
+}
+
 func CreateListener(port int) (*quic.Listener, error) {
 	tlsConf, err := GenerateTLSConfig()
 	if err != nil {
 		return nil, err
 	}
 
-	addr := fmt.Sprintf("0.0.0.0:%d", port)
+	addr := FormatAddress("::", port)
 	listener, err := quic.ListenAddr(addr, tlsConf, highThroughputQUICConfig())
 	if err != nil {
 		return nil, fmt.Errorf("starting QUIC listener on %s: %w", addr, err)

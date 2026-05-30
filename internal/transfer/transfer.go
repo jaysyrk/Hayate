@@ -26,30 +26,42 @@ const (
 	frameFlagZstd byte = 0x01
 
 	maxFilenameBytes          = 4096
-	maxCompressedOverhead     = 4*1024*1024/8 + 64*1024
+	maxCompressedOverhead     = 8*1024*1024/8 + 64*1024
 	maxMetadataCiphertextSize = 2 + maxFilenameBytes + 8 + 12 + 16
 	maxInt64                  = int64(^uint64(0) >> 1)
 )
 
 var (
-	// 4MB chunks reduce QUIC framing overhead vs 1MB and better saturate fast links.
-	ChunkSize = 4 * 1024 * 1024
+	// 8MB chunks reduce per-frame overhead and help saturate fast Wi-Fi/LAN links.
+	ChunkSize = 8 * 1024 * 1024
 
-	// Scale workers to actual hardware; capped to prevent goroutine thrashing.
+	// Scale workers to actual hardware; capped to use modern big.LITTLE and desktop CPUs.
 	NumWorkers = clampWorkers(runtime.NumCPU())
 
 	// Pipeline queue depth controls backpressure between stages.
-	MaxQueue = 16
+	MaxQueue = clampQueue(runtime.NumCPU())
 )
 
 func clampWorkers(n int) int {
 	if n < 2 {
 		return 2
 	}
-	if n > 16 {
-		return 16
+	n *= 2
+	if n > 32 {
+		return 32
 	}
 	return n
+}
+
+func clampQueue(n int) int {
+	q := clampWorkers(n) * 2
+	if q < 16 {
+		return 16
+	}
+	if q > 64 {
+		return 64
+	}
+	return q
 }
 
 var (
@@ -71,6 +83,7 @@ var (
 type chunkJob struct {
 	index int64
 	data  []byte
+	owner *[]byte
 	size  int
 }
 
@@ -101,6 +114,9 @@ type recvResult struct {
 // and streams them over QUIC using coalesced frame writes.
 // Progress callback receives plaintext bytes consumed.
 func SendFile(ctx context.Context, path string, stream *quic.Stream, key []byte, compressMode string, progressCb func(int64)) (string, error) {
+	opCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
 	file, err := os.Open(path)
 	if err != nil {
 		return "", fmt.Errorf("opening file: %w", err)
@@ -118,15 +134,6 @@ func SendFile(ctx context.Context, path string, stream *quic.Stream, key []byte,
 	}
 
 	compressChunks := ShouldCompress(path, compressMode)
-	var zstdEncoder *zstd.Encoder
-	if compressChunks {
-		zstdEncoder, err = zstd.NewWriter(nil, zstd.WithEncoderLevel(zstd.SpeedFastest), zstd.WithEncoderConcurrency(1))
-		if err != nil {
-			return "", fmt.Errorf("initializing zstd encoder: %w", err)
-		}
-		defer zstdEncoder.Close()
-	}
-
 	shaHasher := sha256.New()
 	jobs := make(chan chunkJob, MaxQueue)
 	results := make(chan chunkResult, MaxQueue)
@@ -134,7 +141,7 @@ func SendFile(ctx context.Context, path string, stream *quic.Stream, key []byte,
 
 	for i := 0; i < NumWorkers; i++ {
 		wg.Add(1)
-		go sendWorker(ctx, &wg, aead, ng, zstdEncoder, compressMode, compressChunks, jobs, results)
+		go sendWorker(opCtx, &wg, aead, ng, compressMode, compressChunks, jobs, results)
 	}
 
 	go func() {
@@ -156,9 +163,10 @@ func SendFile(ctx context.Context, path string, stream *quic.Stream, key []byte,
 			if n > 0 {
 				shaHasher.Write((*bufPtr)[:n])
 				select {
-				case jobs <- chunkJob{index: index, data: *bufPtr, size: n}:
+				case jobs <- chunkJob{index: index, data: *bufPtr, owner: bufPtr, size: n}:
 					index++
-				case <-ctx.Done():
+				case <-opCtx.Done():
+					chunkPool.Put(bufPtr)
 					return
 				}
 			} else {
@@ -186,6 +194,7 @@ func SendFile(ctx context.Context, path string, stream *quic.Stream, key []byte,
 				goto checkReader
 			}
 			if res.err != nil {
+				cancel()
 				return "", fmt.Errorf("worker chunk %d: %w", res.index, res.err)
 			}
 			pending[res.index] = res
@@ -208,8 +217,8 @@ func SendFile(ctx context.Context, path string, stream *quic.Stream, key []byte,
 				progressCb(totalPlaintext)
 			}
 
-		case <-ctx.Done():
-			return "", ctx.Err()
+		case <-opCtx.Done():
+			return "", opCtx.Err()
 		}
 	}
 
@@ -221,10 +230,23 @@ checkReader:
 	return hex.EncodeToString(shaHasher.Sum(nil)), nil
 }
 
-func sendWorker(ctx context.Context, wg *sync.WaitGroup, aead cipher.AEAD, ng *crypto.NonceGen, enc *zstd.Encoder, compressMode string, compressChunks bool, jobs <-chan chunkJob, results chan<- chunkResult) {
+func sendWorker(ctx context.Context, wg *sync.WaitGroup, aead cipher.AEAD, ng *crypto.NonceGen, compressMode string, compressChunks bool, jobs <-chan chunkJob, results chan<- chunkResult) {
 	defer wg.Done()
 	var compBuf []byte
 	var plainFrame []byte
+	var enc *zstd.Encoder
+	if compressChunks {
+		var err error
+		enc, err = zstd.NewWriter(nil, zstd.WithEncoderLevel(zstd.SpeedFastest), zstd.WithEncoderConcurrency(1))
+		if err != nil {
+			select {
+			case results <- chunkResult{err: fmt.Errorf("initializing zstd encoder: %w", err)}:
+			case <-ctx.Done():
+			}
+			return
+		}
+		defer enc.Close()
+	}
 
 	for job := range jobs {
 		payload := job.data[:job.size]
@@ -247,7 +269,7 @@ func sendWorker(ctx context.Context, wg *sync.WaitGroup, aead cipher.AEAD, ng *c
 		plainFrame = plainFrame[:1+len(payload)]
 		plainFrame[0] = flag
 		copy(plainFrame[1:], payload)
-		chunkPool.Put(&job.data)
+		chunkPool.Put(job.owner)
 
 		// Reserve 4 bytes for frame header at the front; encrypt into outBuf[4:].
 		required := 4 + aead.NonceSize() + len(plainFrame) + aead.Overhead()
@@ -284,6 +306,9 @@ func sendWorker(ctx context.Context, wg *sync.WaitGroup, aead cipher.AEAD, ng *c
 // in parallel across NumWorkers goroutines, then writes plaintext to disk
 // in sequential order. Progress callback receives plaintext bytes written.
 func ReceiveFile(ctx context.Context, path string, stream *quic.Stream, key []byte, expectedSize int64, progressCb func(int64)) (string, error) {
+	opCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
 	file, err := os.Create(path)
 	if err != nil {
 		return "", fmt.Errorf("creating file: %w", err)
@@ -295,19 +320,13 @@ func ReceiveFile(ctx context.Context, path string, stream *quic.Stream, key []by
 		return "", fmt.Errorf("creating cipher: %w", err)
 	}
 
-	zstdDecoder, err := zstd.NewReader(nil)
-	if err != nil {
-		return "", fmt.Errorf("initializing zstd decoder: %w", err)
-	}
-	defer zstdDecoder.Close()
-
 	recvJobs := make(chan recvJob, MaxQueue)
 	recvResults := make(chan recvResult, MaxQueue)
 	var wg sync.WaitGroup
 
 	for i := 0; i < NumWorkers; i++ {
 		wg.Add(1)
-		go recvWorker(ctx, &wg, aead, zstdDecoder, recvJobs, recvResults)
+		go recvWorker(opCtx, &wg, aead, recvJobs, recvResults)
 	}
 
 	go func() {
@@ -353,7 +372,7 @@ func ReceiveFile(ctx context.Context, path string, stream *quic.Stream, key []by
 			select {
 			case recvJobs <- recvJob{index: index, data: buf, dataOwner: bufPtr}:
 				index++
-			case <-ctx.Done():
+			case <-opCtx.Done():
 				cipherPool.Put(bufPtr)
 				return
 			}
@@ -374,6 +393,7 @@ func ReceiveFile(ctx context.Context, path string, stream *quic.Stream, key []by
 				goto checkReader
 			}
 			if res.err != nil {
+				cancel()
 				return "", fmt.Errorf("worker chunk %d: %w", res.index, res.err)
 			}
 			pending[res.index] = res
@@ -401,8 +421,8 @@ func ReceiveFile(ctx context.Context, path string, stream *quic.Stream, key []by
 				}
 			}
 
-		case <-ctx.Done():
-			return "", ctx.Err()
+		case <-opCtx.Done():
+			return "", opCtx.Err()
 		}
 	}
 
@@ -423,9 +443,15 @@ checkReader:
 	return hex.EncodeToString(shaHasher.Sum(nil)), nil
 }
 
-func recvWorker(ctx context.Context, wg *sync.WaitGroup, aead cipher.AEAD, dec *zstd.Decoder, jobs <-chan recvJob, results chan<- recvResult) {
+func recvWorker(ctx context.Context, wg *sync.WaitGroup, aead cipher.AEAD, jobs <-chan recvJob, results chan<- recvResult) {
 	defer wg.Done()
 	var compBuf []byte
+	var dec *zstd.Decoder
+	defer func() {
+		if dec != nil {
+			dec.Close()
+		}
+	}()
 
 	for job := range jobs {
 		// Decrypt in-place into reusable compBuf
@@ -472,6 +498,18 @@ func recvWorker(ctx context.Context, wg *sync.WaitGroup, aead cipher.AEAD, dec *
 			plaintext = (*decompPtr)[:len(payload)]
 			copy(plaintext, payload)
 		case frameFlagZstd:
+			if dec == nil {
+				var err error
+				dec, err = zstd.NewReader(nil)
+				if err != nil {
+					chunkPool.Put(decompPtr)
+					select {
+					case results <- recvResult{index: job.index, err: fmt.Errorf("initializing zstd decoder: %w", err)}:
+					case <-ctx.Done():
+					}
+					return
+				}
+			}
 			var err error
 			plaintext, err = dec.DecodeAll(payload, (*decompPtr)[:0])
 			if err != nil {

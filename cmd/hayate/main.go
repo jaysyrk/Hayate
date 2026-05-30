@@ -80,6 +80,7 @@ func printUsage() {
 	fmt.Println("Examples:")
 	fmt.Println("  hayate send document.pdf")
 	fmt.Println("  hayate send archive.tar.gz --peer 192.168.1.50:50001")
+	fmt.Println("  hayate send archive.tar.gz --peer [fd00::50]:50001")
 	fmt.Println("  hayate receive --port 5000 --output ~/Downloads")
 }
 
@@ -205,7 +206,7 @@ func handleDiscover() {
 	fmt.Printf("  %-20s  %-22s  %s\n", "NAME", "ADDRESS", "OS")
 	fmt.Printf("  %s\n", strings.Repeat("-", 54))
 	for _, p := range peers {
-		fmt.Printf("  %-20s  %-22s  %s\n", p.Name, fmt.Sprintf("%s:%d", p.IP, p.Port), p.OS)
+		fmt.Printf("  %-20s  %-22s  %s\n", p.Name, network.FormatAddress(p.IP, p.Port), p.OS)
 	}
 	fmt.Println()
 }
@@ -335,7 +336,7 @@ func runSenderOrchestrator(ctx context.Context, m *tui.Model, filePath string, p
 		}
 		select {
 		case sel := <-m.SelectedPeerChan:
-			targetAddr = net.JoinHostPort(sel.IP, strconv.Itoa(sel.Port))
+			targetAddr = network.FormatAddress(sel.IP, sel.Port)
 		case <-ctx.Done():
 			return
 		}
@@ -413,6 +414,13 @@ func runReceiverOrchestrator(ctx context.Context, m *tui.Model, listenPort int, 
 		}
 	} else {
 		defer advServer.Shutdown()
+	}
+
+	listenAddr := network.FormatAddress(network.GetLocalIP(), listenPort)
+	select {
+	case m.MsgChan <- tui.ListeningMsg{Port: listenPort, LocalAddr: listenAddr}:
+	case <-ctx.Done():
+		return
 	}
 
 	conn, err := listener.Accept(ctx)
@@ -495,7 +503,7 @@ func runSenderHeadless(ctx context.Context, filePath string, peerAddr string, sc
 			fail("No peers found on the local network")
 		}
 		selected := peers[0]
-		targetAddr = net.JoinHostPort(selected.IP, strconv.Itoa(selected.Port))
+		targetAddr = network.FormatAddress(selected.IP, selected.Port)
 		done("Selected peer: %s (%s)", selected.Name, targetAddr)
 	} else {
 		targetAddr = peerAddr

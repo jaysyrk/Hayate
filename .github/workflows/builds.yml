@@ -1,0 +1,79 @@
+name: Builds
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: ${{ matrix.name }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: hayate-darwin-amd64
+            goos: darwin
+            goarch: amd64
+            output: hayate-darwin-amd64
+          - name: hayate-darwin-arm64
+            goos: darwin
+            goarch: arm64
+            output: hayate-darwin-arm64
+          - name: hayate-linux-amd64
+            goos: linux
+            goarch: amd64
+            output: hayate-linux-amd64
+          - name: hayate-linux-arm64
+            goos: linux
+            goarch: arm64
+            output: hayate-linux-arm64
+          - name: hayate-termux-arm64
+            goos: linux
+            goarch: arm64
+            output: hayate-termux-arm64
+          - name: hayate-windows-amd64
+            goos: windows
+            goarch: amd64
+            output: hayate-windows-amd64.exe
+          - name: hayate-windows-arm64
+            goos: windows
+            goarch: arm64
+            output: hayate-windows-arm64.exe
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Build
+        env:
+          CGO_ENABLED: "0"
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+        run: |
+          mkdir -p dist
+          go build -trimpath -ldflags="-s -w" -o "dist/${{ matrix.output }}" ./cmd/hayate
+
+      - name: Checksums
+        run: |
+          cd dist
+          sha256sum "${{ matrix.output }}" > "${{ matrix.output }}.sha256"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.name }}
+          path: |
+            dist/${{ matrix.output }}
+            dist/${{ matrix.output }}.sha256
+          if-no-files-found: error
