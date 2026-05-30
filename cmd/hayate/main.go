@@ -9,7 +9,9 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"bufio"
 
+	"hayate/internal/crypto"
 	"hayate/internal/network"
 	"hayate/internal/transfer"
 	"hayate/internal/tui"
@@ -91,12 +93,14 @@ func handleSend() {
 	compressFlag := sendCmd.String("compress", transfer.CompressAuto, "Compression mode: auto, always, never")
 	noTuiFlag := sendCmd.Bool("no-tui", false, "Disable interactive TUI")
 
+	passFlag := sendCmd.String("password", "", "Passphrase for mutual authentication")
+
 	_ = sendCmd.Parse(os.Args[2:])
 
 	args := sendCmd.Args()
 	if len(args) < 1 {
 		fmt.Println("Error: file path required")
-		fmt.Println("Usage: hayate send <file> [--peer ip:port] [--compress auto|always|never] [--no-tui]")
+		fmt.Println("Usage: hayate send <file> [--peer ip:port] [--compress auto|always|never] [--no-tui] [--password phrase]")
 		os.Exit(1)
 	}
 	compressMode, ok := transfer.NormalizeCompressionMode(*compressFlag)
@@ -123,14 +127,16 @@ func handleSend() {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
+	password := *passFlag
+
 	if *noTuiFlag || !isatty.IsTerminal(os.Stdout.Fd()) {
-		runSenderHeadless(ctx, absPath, *peerFlag, *durationFlag, compressMode)
+		runSenderHeadless(ctx, absPath, *peerFlag, *durationFlag, compressMode, password)
 		return
 	}
 
 	localIP := network.GetLocalIP()
-	model := tui.NewModel(ctx, cancel, "send", absPath, *peerFlag, 0, localIP, "")
-	go runSenderOrchestrator(ctx, &model, absPath, *peerFlag, *durationFlag, compressMode)
+	model := tui.NewModel(ctx, cancel, "send", absPath, *peerFlag, 0, localIP, "", password)
+	go runSenderOrchestrator(ctx, &model, absPath, *peerFlag, *durationFlag, compressMode, password)
 
 	p := tea.NewProgram(model)
 	if _, err := p.Run(); err != nil {
@@ -145,6 +151,7 @@ func handleReceive() {
 	nameFlag := recvCmd.String("name", "", "mDNS display name")
 	noTuiFlag := recvCmd.Bool("no-tui", false, "Disable interactive TUI")
 	outputFlag := recvCmd.String("output", ".", "Download directory")
+	passFlag := recvCmd.String("password", "", "Passphrase for mutual authentication")
 
 	_ = recvCmd.Parse(os.Args[2:])
 
@@ -162,17 +169,25 @@ func handleReceive() {
 		}
 	}
 
+	password := *passFlag
+	if password == "" {
+		p, err := crypto.GeneratePassphrase(4)
+		if err == nil {
+			password = p
+		}
+	}
+
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
 	if *noTuiFlag || !isatty.IsTerminal(os.Stdout.Fd()) {
-		runReceiverHeadless(ctx, *portFlag, hostname, *outputFlag)
+		runReceiverHeadless(ctx, *portFlag, hostname, *outputFlag, password)
 		return
 	}
 
 	localIP := network.GetLocalIP()
-	model := tui.NewModel(ctx, cancel, "receive", "", "", *portFlag, localIP, hostname)
-	go runReceiverOrchestrator(ctx, &model, *portFlag, hostname, *outputFlag)
+	model := tui.NewModel(ctx, cancel, "receive", "", "", *portFlag, localIP, hostname, password)
+	go runReceiverOrchestrator(ctx, &model, *portFlag, hostname, *outputFlag, password)
 
 	p := tea.NewProgram(model)
 	if _, err := p.Run(); err != nil {
@@ -313,7 +328,7 @@ func formatBytes(b int64) string {
 
 // -- TUI Orchestrators --
 
-func runSenderOrchestrator(ctx context.Context, m *tui.Model, filePath string, peerAddr string, scanDuration time.Duration, compressMode string) {
+func runSenderOrchestrator(ctx context.Context, m *tui.Model, filePath string, peerAddr string, scanDuration time.Duration, compressMode string, password string) {
 	stat, err := os.Stat(filePath)
 	if err != nil {
 		m.MsgChan <- tui.ErrorMsg{Err: fmt.Errorf("stat: %w", err)}
@@ -344,6 +359,15 @@ func runSenderOrchestrator(ctx context.Context, m *tui.Model, filePath string, p
 		targetAddr = peerAddr
 	}
 
+	if password == "" {
+		select {
+		case pass := <-m.PasswordChan:
+			password = pass
+		case <-ctx.Done():
+			return
+		}
+	}
+
 	conn, err := network.DialPeer(ctx, targetAddr)
 	if err != nil {
 		m.MsgChan <- tui.ErrorMsg{Err: fmt.Errorf("connect: %w", err)}
@@ -358,7 +382,7 @@ func runSenderOrchestrator(ctx context.Context, m *tui.Model, filePath string, p
 	}
 	defer stream.Close()
 
-	key, err := transfer.EstablishSecureStreamSender(ctx, stream, filename, fileSize)
+	key, err := transfer.EstablishSecureStreamSender(ctx, stream, filename, fileSize, password)
 	if err != nil {
 		m.MsgChan <- tui.ErrorMsg{Err: fmt.Errorf("handshake: %w", err)}
 		return
@@ -391,7 +415,7 @@ func runSenderOrchestrator(ctx context.Context, m *tui.Model, filePath string, p
 	}
 }
 
-func runReceiverOrchestrator(ctx context.Context, m *tui.Model, listenPort int, advertisedName string, outputDir string) {
+func runReceiverOrchestrator(ctx context.Context, m *tui.Model, listenPort int, advertisedName string, outputDir string, password string) {
 	listener, err := network.CreateListener(listenPort)
 	if err != nil {
 		m.MsgChan <- tui.ErrorMsg{Err: fmt.Errorf("listener: %w", err)}
@@ -442,7 +466,7 @@ func runReceiverOrchestrator(ctx context.Context, m *tui.Model, listenPort int, 
 	}
 	defer stream.Close()
 
-	key, filename, fileSize, err := transfer.EstablishSecureStreamReceiver(ctx, stream)
+	key, filename, fileSize, err := transfer.EstablishSecureStreamReceiver(ctx, stream, password)
 	if err != nil {
 		m.MsgChan <- tui.ErrorMsg{Err: fmt.Errorf("handshake: %w", err)}
 		return
@@ -480,7 +504,7 @@ func runReceiverOrchestrator(ctx context.Context, m *tui.Model, listenPort int, 
 
 // -- Headless Flows --
 
-func runSenderHeadless(ctx context.Context, filePath string, peerAddr string, scanDuration time.Duration, compressMode string) {
+func runSenderHeadless(ctx context.Context, filePath string, peerAddr string, scanDuration time.Duration, compressMode string, password string) {
 	printBanner()
 
 	stat, err := os.Stat(filePath)
@@ -509,6 +533,13 @@ func runSenderHeadless(ctx context.Context, filePath string, peerAddr string, sc
 		targetAddr = peerAddr
 	}
 
+	if password == "" {
+		fmt.Print("  [*] Enter receiver's passphrase (or leave empty for unauthenticated): ")
+		reader := bufio.NewReader(os.Stdin)
+		pass, _ := reader.ReadString('\n')
+		password = strings.TrimSpace(pass)
+	}
+
 	step("Connecting to %s...", targetAddr)
 	conn, err := network.DialPeer(ctx, targetAddr)
 	if err != nil {
@@ -523,7 +554,7 @@ func runSenderHeadless(ctx context.Context, filePath string, peerAddr string, sc
 	defer stream.Close()
 
 	step("Performing cryptographic handshake...")
-	key, err := transfer.EstablishSecureStreamSender(ctx, stream, filename, fileSize)
+	key, err := transfer.EstablishSecureStreamSender(ctx, stream, filename, fileSize, password)
 	if err != nil {
 		fail("Handshake failed: %v", err)
 	}
@@ -580,8 +611,12 @@ func runSenderHeadless(ctx context.Context, filePath string, peerAddr string, sc
 	})
 }
 
-func runReceiverHeadless(ctx context.Context, listenPort int, advertisedName string, outputDir string) {
+func runReceiverHeadless(ctx context.Context, listenPort int, advertisedName string, outputDir string, password string) {
 	printBanner()
+
+	if password != "" {
+		step("Passphrase: %s", password)
+	}
 
 	listener, err := network.CreateListener(listenPort)
 	if err != nil {
@@ -628,7 +663,7 @@ func runReceiverHeadless(ctx context.Context, listenPort int, advertisedName str
 	defer stream.Close()
 
 	step("Performing cryptographic handshake...")
-	key, filename, fileSize, err := transfer.EstablishSecureStreamReceiver(ctx, stream)
+	key, filename, fileSize, err := transfer.EstablishSecureStreamReceiver(ctx, stream, password)
 	if err != nil {
 		fail("Handshake failed: %v", err)
 	}

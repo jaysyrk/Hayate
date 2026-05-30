@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"crypto/rand"
 	"runtime"
 	"sync"
 
@@ -539,19 +540,56 @@ func recvWorker(ctx context.Context, wg *sync.WaitGroup, aead cipher.AEAD, jobs 
 }
 
 // EstablishSecureStreamSender performs ephemeral key exchange and sends file metadata.
-func EstablishSecureStreamSender(ctx context.Context, stream *quic.Stream, filename string, fileSize int64) ([]byte, error) {
+func EstablishSecureStreamSender(ctx context.Context, stream *quic.Stream, filename string, fileSize int64, passphrase string) ([]byte, error) {
 	priv, pub, err := crypto.GenerateEphemeralKeyPair()
 	if err != nil {
 		return nil, fmt.Errorf("generating keypair: %w", err)
 	}
 
-	if _, err := stream.Write(pub); err != nil {
-		return nil, fmt.Errorf("sending public key: %w", err)
-	}
+	var peerPub []byte
 
-	peerPub := make([]byte, 32)
-	if _, err := io.ReadFull(stream, peerPub); err != nil {
-		return nil, fmt.Errorf("reading peer public key: %w", err)
+	if passphrase != "" {
+		salt := make([]byte, 16)
+		if _, err := io.ReadFull(rand.Reader, salt); err != nil {
+			return nil, fmt.Errorf("generating salt: %w", err)
+		}
+		
+		if _, err := stream.Write(append([]byte{0x01}, salt...)); err != nil {
+			return nil, fmt.Errorf("sending auth header: %w", err)
+		}
+
+		kek := crypto.DeriveKEK(passphrase, salt)
+		encPub, err := crypto.Encrypt(kek, pub)
+		if err != nil {
+			return nil, fmt.Errorf("encrypting pubkey: %w", err)
+		}
+		
+		if _, err := stream.Write(encPub); err != nil {
+			return nil, fmt.Errorf("sending encrypted pubkey: %w", err)
+		}
+
+		encPeerPub := make([]byte, 60)
+		if _, err := io.ReadFull(stream, encPeerPub); err != nil {
+			return nil, fmt.Errorf("reading encrypted peer pubkey: %w", err)
+		}
+		
+		peerPub, err = crypto.Decrypt(kek, encPeerPub)
+		if err != nil {
+			return nil, fmt.Errorf("invalid passphrase or handshake failed: %w", err)
+		}
+	} else {
+		if _, err := stream.Write([]byte{0x00}); err != nil {
+			return nil, fmt.Errorf("sending plain header: %w", err)
+		}
+
+		if _, err := stream.Write(pub); err != nil {
+			return nil, fmt.Errorf("sending public key: %w", err)
+		}
+
+		peerPub = make([]byte, 32)
+		if _, err := io.ReadFull(stream, peerPub); err != nil {
+			return nil, fmt.Errorf("reading peer public key: %w", err)
+		}
 	}
 
 	key, err := crypto.DeriveSharedSecret(priv, peerPub)
@@ -589,19 +627,65 @@ func EstablishSecureStreamSender(ctx context.Context, stream *quic.Stream, filen
 }
 
 // EstablishSecureStreamReceiver performs ephemeral key exchange and receives file metadata.
-func EstablishSecureStreamReceiver(ctx context.Context, stream *quic.Stream) ([]byte, string, int64, error) {
+func EstablishSecureStreamReceiver(ctx context.Context, stream *quic.Stream, passphrase string) ([]byte, string, int64, error) {
 	priv, pub, err := crypto.GenerateEphemeralKeyPair()
 	if err != nil {
 		return nil, "", 0, fmt.Errorf("generating keypair: %w", err)
 	}
 
-	peerPub := make([]byte, 32)
-	if _, err := io.ReadFull(stream, peerPub); err != nil {
-		return nil, "", 0, fmt.Errorf("reading peer public key: %w", err)
+	flag := make([]byte, 1)
+	if _, err := io.ReadFull(stream, flag); err != nil {
+		return nil, "", 0, fmt.Errorf("reading auth header: %w", err)
 	}
 
-	if _, err := stream.Write(pub); err != nil {
-		return nil, "", 0, fmt.Errorf("sending public key: %w", err)
+	var peerPub []byte
+
+	if flag[0] == 0x01 {
+		if passphrase == "" {
+			return nil, "", 0, fmt.Errorf("sender requires a passphrase, but none was provided")
+		}
+
+		salt := make([]byte, 16)
+		if _, err := io.ReadFull(stream, salt); err != nil {
+			return nil, "", 0, fmt.Errorf("reading salt: %w", err)
+		}
+
+		kek := crypto.DeriveKEK(passphrase, salt)
+		
+		encPeerPub := make([]byte, 60)
+		if _, err := io.ReadFull(stream, encPeerPub); err != nil {
+			return nil, "", 0, fmt.Errorf("reading encrypted peer pubkey: %w", err)
+		}
+		
+		peerPub, err = crypto.Decrypt(kek, encPeerPub)
+		if err != nil {
+			return nil, "", 0, fmt.Errorf("invalid passphrase or handshake failed: %w", err)
+		}
+
+		encPub, err := crypto.Encrypt(kek, pub)
+		if err != nil {
+			return nil, "", 0, fmt.Errorf("encrypting pubkey: %w", err)
+		}
+		
+		if _, err := stream.Write(encPub); err != nil {
+			return nil, "", 0, fmt.Errorf("sending encrypted pubkey: %w", err)
+		}
+
+	} else if flag[0] == 0x00 {
+		if passphrase != "" {
+			return nil, "", 0, fmt.Errorf("receiver requires a passphrase, but sender did not use one")
+		}
+
+		peerPub = make([]byte, 32)
+		if _, err := io.ReadFull(stream, peerPub); err != nil {
+			return nil, "", 0, fmt.Errorf("reading peer public key: %w", err)
+		}
+
+		if _, err := stream.Write(pub); err != nil {
+			return nil, "", 0, fmt.Errorf("sending public key: %w", err)
+		}
+	} else {
+		return nil, "", 0, fmt.Errorf("unknown handshake flag: 0x%02x", flag[0])
 	}
 
 	key, err := crypto.DeriveSharedSecret(priv, peerPub)

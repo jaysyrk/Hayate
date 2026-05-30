@@ -131,3 +131,36 @@ func BenchmarkEncryptInPlace(b *testing.B) {
 		_, _ = EncryptInPlace(aead, ng, plaintext, dst)
 	}
 }
+
+func TestGeneratePassphrase(t *testing.T) {
+	passphrase, err := GeneratePassphrase(4)
+	if err != nil {
+		t.Fatalf("failed to generate passphrase: %v", err)
+	}
+	words := bytes.Split([]byte(passphrase), []byte("-"))
+	if len(words) != 4 {
+		t.Fatalf("expected 4 words, got %d", len(words))
+	}
+}
+
+func TestDeriveKEK(t *testing.T) {
+	salt := []byte("test-salt-123456")
+	passphrase := "apple-bacon-cabin-dance"
+
+	key1 := DeriveKEK(passphrase, salt)
+	key2 := DeriveKEK(passphrase, salt)
+
+	if !bytes.Equal(key1, key2) {
+		t.Fatal("DeriveKEK should be deterministic for same inputs")
+	}
+
+	key3 := DeriveKEK("different-passphrase", salt)
+	if bytes.Equal(key1, key3) {
+		t.Fatal("DeriveKEK should differ for different passphrases")
+	}
+
+	key4 := DeriveKEK(passphrase, []byte("different-salt"))
+	if bytes.Equal(key1, key4) {
+		t.Fatal("DeriveKEK should differ for different salts")
+	}
+}

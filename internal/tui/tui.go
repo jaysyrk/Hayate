@@ -11,6 +11,7 @@ import (
 	"hayate/internal/transfer"
 
 	"github.com/charmbracelet/bubbles/spinner"
+	"github.com/charmbracelet/bubbles/textinput"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 	"github.com/muesli/termenv"
@@ -21,6 +22,7 @@ type State int
 const (
 	StateDiscover State = iota
 	StateSelectPeer
+	StatePasswordPrompt
 	StateHandshake
 	StateTransferring
 	StateCompleted
@@ -199,33 +201,54 @@ type Model struct {
 	hash         string
 	compSize     int64
 	isSend       bool
+	password     string
 
 	spinner          spinner.Model
+	textInput        textinput.Model
 	MsgChan          chan tea.Msg
 	SelectedPeerChan chan network.Peer
+	PasswordChan     chan string
 	Ctx              context.Context
 	Cancel           context.CancelFunc
 }
 
-func NewModel(ctx context.Context, cancel context.CancelFunc, mode string, filePath string, peerAddr string, port int, localIP string, advertised string) Model {
+func NewModel(ctx context.Context, cancel context.CancelFunc, mode string, filePath string, peerAddr string, port int, localIP string, advertised string, password string) Model {
 	s := spinner.New()
 	s.Spinner = spinner.Line
 	s.Style = lipgloss.NewStyle().Foreground(cyan)
 
+	ti := textinput.New()
+	ti.Placeholder = "Enter 4-word passphrase (or empty for none)"
+	ti.Focus()
+	ti.CharLimit = 128
+	ti.Width = 40
+
+	initialState := StateDiscover
+	if mode == "send" && peerAddr != "" {
+		if password == "" {
+			initialState = StatePasswordPrompt
+		} else {
+			initialState = StateHandshake
+		}
+	}
+
 	return Model{
 		Mode:             mode,
-		state:            StateDiscover,
+		state:            initialState,
 		filePath:         filePath,
 		peerAddr:         peerAddr,
 		port:             port,
 		localIP:          localIP,
 		localAddr:        localIP,
 		advertised:       advertised,
+		password:         password,
 		width:            80,
 		asciiOnly:        !termenv.HasDarkBackground() || termenv.ColorProfile() == termenv.Ascii,
 		spinner:          s,
+		textInput:        ti,
 		MsgChan:          make(chan tea.Msg, 64),
 		SelectedPeerChan: make(chan network.Peer, 1),
+		PasswordChan:     make(chan string, 1),
 		Ctx:              ctx,
 		Cancel:           cancel,
 	}
@@ -259,6 +282,12 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 
 	case tea.KeyMsg:
+		if m.state == StatePasswordPrompt && msg.String() != "enter" && msg.String() != "ctrl+c" && msg.String() != "esc" {
+			var cmd tea.Cmd
+			m.textInput, cmd = m.textInput.Update(msg)
+			return m, cmd
+		}
+
 		switch msg.String() {
 		case "ctrl+c", "esc":
 			m.Cancel()
@@ -278,12 +307,23 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "enter":
 			if m.state == StateSelectPeer && len(m.peers) > 0 {
 				selected := m.peers[m.selectedIdx]
-				m.state = StateHandshake
 				m.peerAddr = network.FormatAddress(selected.IP, selected.Port)
 				select {
 				case m.SelectedPeerChan <- selected:
 				default:
 				}
+				if m.password == "" {
+					m.state = StatePasswordPrompt
+				} else {
+					m.state = StateHandshake
+				}
+			} else if m.state == StatePasswordPrompt {
+				m.password = strings.TrimSpace(m.textInput.Value())
+				select {
+				case m.PasswordChan <- m.password:
+				default:
+				}
+				m.state = StateHandshake
 			} else if m.state == StateCompleted || m.state == StateError {
 				return m, tea.Quit
 			}
@@ -292,7 +332,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case spinner.TickMsg:
 		var cmd tea.Cmd
 		m.spinner, cmd = m.spinner.Update(msg)
-		cmds = append(cmds, cmd)
+		var tiCmd tea.Cmd
+		m.textInput, tiCmd = m.textInput.Update(msg)
+		cmds = append(cmds, cmd, tiCmd)
 
 	case PeerDiscoveredMsg:
 		m.peers = msg
@@ -392,6 +434,8 @@ func (m Model) View() string {
 		s.WriteString(m.viewDiscover())
 	case StateSelectPeer:
 		s.WriteString(m.viewSelectPeer())
+	case StatePasswordPrompt:
+		s.WriteString(m.viewPasswordPrompt())
 	case StateHandshake:
 		s.WriteString(m.viewHandshake())
 	case StateTransferring:
@@ -443,7 +487,14 @@ func (m Model) viewDiscover() string {
 		if m.advertised != "" {
 			s.WriteString(fmt.Sprintf("  (advertised as %s)", m.advertised))
 		}
-		s.WriteString("\n")
+		s.WriteString("\n\n")
+		if m.password != "" {
+			pw := m.password
+			if !m.asciiOnly {
+				pw = hashStyle.Render(pw)
+			}
+			s.WriteString("  Passphrase: " + pw + "\n")
+		}
 	}
 
 	s.WriteString(hint("Esc to abort"))
@@ -479,6 +530,15 @@ func (m Model) viewSelectPeer() string {
 
 	s.WriteString(tableHeaderStyle.Render("    "+strings.Repeat("-", nameW+addrW+14)) + "\n")
 	s.WriteString(hint("j/k or Up/Down to navigate  |  Enter to select  |  Esc to cancel"))
+	return s.String()
+}
+
+func (m Model) viewPasswordPrompt() string {
+	var s strings.Builder
+	s.WriteString(sectionStyle.Render("[ AUTHENTICATION ]") + "\n\n")
+	s.WriteString("  Enter receiver's passphrase (leave empty if none):\n\n")
+	s.WriteString("  " + m.textInput.View() + "\n\n")
+	s.WriteString(hint("Enter to submit  |  Esc to cancel"))
 	return s.String()
 }
 

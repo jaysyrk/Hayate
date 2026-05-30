@@ -150,3 +150,81 @@ func TestFileTransferPipeline(t *testing.T) {
 		t.Fatal("Destination file bytes do not match source file bytes!")
 	}
 }
+
+func TestSecureStreamHandshake(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	listener, err := network.CreateListener(0)
+	if err != nil {
+		t.Fatalf("Failed to create QUIC listener: %v", err)
+	}
+	defer listener.Close()
+
+	_, portStr, _ := net.SplitHostPort(listener.Addr().String())
+	addr := net.JoinHostPort("127.0.0.1", portStr)
+
+	testCases := []struct {
+		name         string
+		senderPass   string
+		receiverPass string
+		expectErr    bool
+	}{
+		{"NoAuth", "", "", false},
+		{"ValidAuth", "apple-bacon-cabin-dance", "apple-bacon-cabin-dance", false},
+		{"WrongAuth", "apple-bacon-cabin-dance", "different-passphrase", true},
+		{"SenderOnlyAuth", "apple-bacon-cabin-dance", "", true},
+		{"ReceiverOnlyAuth", "", "apple-bacon-cabin-dance", true},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			recvErrChan := make(chan error, 1)
+			go func() {
+				conn, err := listener.Accept(ctx)
+				if err != nil {
+					recvErrChan <- err
+					return
+				}
+				defer conn.CloseWithError(0, "done")
+				stream, err := conn.AcceptStream(ctx)
+				if err != nil {
+					recvErrChan <- err
+					return
+				}
+				defer stream.Close()
+				_, _, _, err = EstablishSecureStreamReceiver(ctx, stream, tc.receiverPass)
+				recvErrChan <- err
+			}()
+
+			clientConn, err := network.DialPeer(ctx, addr)
+			if err != nil {
+				t.Fatalf("Client failed to dial: %v", err)
+			}
+			clientStream, err := clientConn.OpenStreamSync(ctx)
+			if err != nil {
+				t.Fatalf("Client failed to open stream: %v", err)
+			}
+
+			_, sendErr := EstablishSecureStreamSender(ctx, clientStream, "test.txt", 1024, tc.senderPass)
+			recvErr := <-recvErrChan
+
+			clientStream.Close()
+			clientConn.CloseWithError(0, "done")
+
+			if tc.expectErr {
+				if sendErr == nil && recvErr == nil {
+					t.Fatalf("expected error, but got none")
+				}
+			} else {
+				if sendErr != nil {
+					t.Fatalf("unexpected sender error: %v", sendErr)
+				}
+				if recvErr != nil {
+					t.Fatalf("unexpected receiver error: %v", recvErr)
+				}
+			}
+		})
+	}
+}
+
